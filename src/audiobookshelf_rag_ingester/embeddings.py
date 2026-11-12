@@ -1,0 +1,135 @@
+import logging
+from dataclasses import dataclass, field
+from typing import Protocol
+
+import httpx
+
+from audiobookshelf_rag_ingester.config import Settings
+
+logger = logging.getLogger(__name__)
+
+_CHARS_PER_TOKEN = 4
+
+
+class Embedder(Protocol):
+    def encode(self, texts: list[str]) -> list[list[float]]: ...
+
+    @property
+    def dimension(self) -> int: ...
+
+
+def truncate(texts: list[str], max_tokens: int) -> list[str]:
+    """Truncate texts that would exceed the model's context length (~4 chars/token)."""
+    if max_tokens <= 0:
+        return texts
+    max_chars = max_tokens * _CHARS_PER_TOKEN
+    result: list[str] = []
+    for text in texts:
+        if len(text) > max_chars:
+            logger.warning(
+                "Truncating text from %d to %d chars (~%d token limit)",
+                len(text),
+                max_chars,
+                max_tokens,
+            )
+            text = text[:max_chars]
+        result.append(text)
+    return result
+
+
+class _DimensionMixin:
+    _dimension: int | None = None
+
+    @property
+    def dimension(self) -> int:
+        if self._dimension is None:
+            self._dimension = len(self.encode(["dimension probe"])[0])  # type: ignore[attr-defined]
+        return self._dimension
+
+
+@dataclass
+class OllamaEmbedder(_DimensionMixin):
+    model_name: str
+    ollama_url: str
+    api_key: str | None = None
+    timeout_seconds: int = 120
+    max_tokens: int = 0
+    batch_size: int = 32
+    transport: httpx.BaseTransport | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else None
+        self._client = httpx.Client(
+            base_url=self.ollama_url.rstrip("/"),
+            headers=headers,
+            timeout=self.timeout_seconds,
+            transport=self.transport,
+        )
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        texts = truncate(texts, self.max_tokens)
+        vectors: list[list[float]] = []
+        step = max(1, self.batch_size)
+        for start in range(0, len(texts), step):
+            batch = texts[start : start + step]
+            response = self._client.post(
+                "/api/embed", json={"model": self.model_name, "input": batch}
+            )
+            response.raise_for_status()
+            embeddings = response.json().get("embeddings")
+            if not isinstance(embeddings, list) or len(embeddings) != len(batch):
+                raise ValueError(
+                    "Ollama /api/embed response missing or wrong-length 'embeddings'"
+                )
+            vectors.extend(embeddings)
+        return vectors
+
+
+@dataclass
+class SentenceTransformerEmbedder(_DimensionMixin):
+    model_name: str
+    cache_dir: str | None = None
+    max_tokens: int = 0
+    batch_size: int = 32
+
+    def __post_init__(self) -> None:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            raise ImportError(
+                "sentence-transformers is not installed. "
+                "Install with: "
+                "pip install 'audiobookshelf-rag-ingester[sentence-transformers]'"
+            ) from None
+        self._model = SentenceTransformer(self.model_name, cache_folder=self.cache_dir)
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        texts = truncate(texts, self.max_tokens)
+        vectors = self._model.encode(
+            texts, batch_size=self.batch_size, show_progress_bar=False
+        )
+        return [v.tolist() if hasattr(v, "tolist") else list(v) for v in vectors]
+
+
+def build_embedder(settings: Settings) -> Embedder:
+    provider = settings.embedding_provider
+    if provider in {"sentence_transformers", "sentence-transformers", "st"}:
+        return SentenceTransformerEmbedder(
+            model_name=settings.embedding_model,
+            cache_dir=settings.hf_cache_dir,
+            max_tokens=settings.embedding_context_length,
+            batch_size=settings.embedding_batch_size,
+        )
+    if provider == "ollama":
+        return OllamaEmbedder(
+            model_name=settings.embedding_model,
+            ollama_url=settings.ollama_url,
+            api_key=settings.ollama_api_key,
+            timeout_seconds=max(settings.request_timeout_seconds, 120),
+            max_tokens=settings.embedding_context_length,
+            batch_size=settings.embedding_batch_size,
+        )
+    raise ValueError(
+        f"Unsupported EMBEDDING_PROVIDER '{provider}'. "
+        "Supported: ollama, sentence_transformers"
+    )

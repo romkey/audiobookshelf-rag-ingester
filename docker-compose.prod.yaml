@@ -1,0 +1,53 @@
+# Production: runs the released image from ghcr.io, plus Qdrant. Configure
+# it in .env next to this file (see .env.example and docs/configuration.md).
+#
+#   docker compose -f docker-compose.prod.yaml up -d
+#   APP_VERSION=1.2.3 docker compose -f docker-compose.prod.yaml up -d   # pin a release
+#   docker compose -f docker-compose.prod.yaml build   # build the image locally instead
+#
+# Already running Qdrant elsewhere? Delete the qdrant service and depends_on,
+# and set QDRANT_URL in .env.
+
+services:
+  app:
+    image: ghcr.io/romkey/audiobookshelf-rag-ingester:${APP_VERSION:-latest}
+    build:
+      context: .
+      target: production
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - qdrant
+    # The app is a worker with no port: it touches a heartbeat file while it
+    # works and sleeps, and this fails if the file goes stale.
+    healthcheck:
+      test: ["CMD", "audiobookshelf-rag-ingester", "healthcheck"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # Least privilege: nothing to write but /tmp, no capabilities.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+volumes:
+  qdrant-data:

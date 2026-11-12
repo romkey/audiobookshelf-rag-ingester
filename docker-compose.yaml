@@ -1,0 +1,46 @@
+# Development: runs the app from your working tree, with the dev
+# dependencies installed, against a local Qdrant.
+#
+#   cp .env.example .env              # then edit it
+#   docker compose up --build         # Qdrant dashboard: http://localhost:6333/dashboard
+#   docker compose run --rm app bash  # a shell with everything installed
+#   docker compose run --rm app audiobookshelf-rag-ingester query "space opera"
+#
+# Restart the app (docker compose restart app) to pick up code changes.
+# Tests, lint and production have their own compose files:
+#
+#   docker compose -f docker-compose.test.yaml run --rm test
+#   docker compose -f docker-compose.lint.yaml run --rm lint
+#   docker compose -f docker-compose.prod.yaml up -d
+
+services:
+  app:
+    build:
+      context: .
+      target: dev
+    # uv run re-syncs /venv if pyproject.toml or uv.lock changed.
+    command: uv run --locked python -m audiobookshelf_rag_ingester
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      QDRANT_URL: http://qdrant:6333
+    # Reach an Ollama running on the Docker host as host.docker.internal.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - qdrant
+    volumes:
+      - .:/app
+      - uv-cache:/root/.cache/uv
+
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+volumes:
+  uv-cache:
+  qdrant-data:

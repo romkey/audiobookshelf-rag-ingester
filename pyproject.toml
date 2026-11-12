@@ -1,0 +1,91 @@
+[project]
+name = "audiobookshelf-rag-ingester"
+version = "0.0.0"
+description = "Mirrors an Audiobookshelf server (audiobooks, podcasts, ebooks) into Qdrant for RAG."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "John Romkey" }]
+# Keep in step with .python-version and the Dockerfile's python image.
+requires-python = ">=3.15"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.15",
+]
+dependencies = [
+  # Audiobookshelf REST API and Ollama embeddings.
+  "httpx>=0.28.1",
+  # Vector store.
+  "qdrant-client>=1.20.0",
+  # HTML descriptions and EPUB chapters to text.
+  "beautifulsoup4>=4.15.0",
+  # Text from attached ebooks.
+  "ebooklib>=0.21",
+  "pypdf>=7.0.1",
+]
+
+[project.optional-dependencies]
+# In-process embeddings instead of Ollama. Large (PyTorch); not in the image.
+sentence-transformers = ["sentence-transformers>=6.3.0"]
+
+[project.urls]
+Homepage = "https://github.com/romkey/audiobookshelf-rag-ingester"
+Changelog = "https://github.com/romkey/audiobookshelf-rag-ingester/blob/main/CHANGELOG.md"
+Issues = "https://github.com/romkey/audiobookshelf-rag-ingester/issues"
+
+[project.scripts]
+audiobookshelf-rag-ingester = "audiobookshelf_rag_ingester.__main__:main"
+
+[dependency-groups]
+dev = [
+  "mypy>=2.4.1",
+  "pytest>=9.2.0",
+  "pytest-cov>=7.1.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.ruff.lint]
+select = [
+  "E", "W", "F",  # pycodestyle, pyflakes
+  "I",            # import order
+  "N",            # naming
+  "UP",           # modern syntax for requires-python
+  "B",            # likely bugs
+  "S",            # security
+  "C4", "SIM", "RET", "PTH",
+  "DTZ",          # timezone-aware datetimes
+  "T20",          # no print(); use logging
+  "LOG", "G",     # logging calls
+  "PT",           # pytest style
+  "RUF",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]  # assert is how pytest works
+"scripts/**" = ["T20"]  # command-line tools print
+
+[tool.mypy]
+strict = true
+files = ["src", "tests", "scripts"]
+
+# Optional extra, not installed in dev; has no stubs either way.
+[[tool.mypy.overrides]]
+module = ["sentence_transformers"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = ["--cov", "--cov-report=term-missing", "--strict-markers"]
+testpaths = ["tests"]
+xfail_strict = true
+
+[tool.coverage.run]
+source = ["audiobookshelf_rag_ingester"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 80
+skip_covered = true
+exclude_also = ['if __name__ == "__main__":']
