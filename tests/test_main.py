@@ -183,6 +183,7 @@ def test_search_and_format(store: QdrantStore) -> None:
     service.run_cycle()
 
     hits = search(store, embedder, "The Long Way", limit=3, chunk_type="item_metadata")
+    assert embedder.kinds[-1] == "query"
     assert len(hits) == 1
     out = io.StringIO()
     format_hits(hits, out, show_text=True, width=60)

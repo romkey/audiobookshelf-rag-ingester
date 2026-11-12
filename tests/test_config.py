@@ -11,6 +11,9 @@ def test_defaults() -> None:
     assert s.abs_public_url == s.abs_url
     assert s.abs_libraries == ()
     assert s.embedding_provider == "openai"
+    assert s.embedding_model == "nomic-ai/modernbert-embed-base"
+    assert s.embedding_query_prefix == ""
+    assert s.embedding_document_prefix == ""
     assert s.chunk_size == 1200
     assert s.ebook_max_bytes == 100 * 1024 * 1024
     assert s.poll_interval_seconds == 3600
@@ -25,6 +28,8 @@ def test_everything_set() -> None:
         "INGEST_EBOOKS": "no",
         "EBOOK_MAX_MB": "5",
         "EMBEDDING_PROVIDER": "sentence-transformers",
+        "EMBEDDING_QUERY_PREFIX": " search_query: ",
+        "EMBEDDING_DOCUMENT_PREFIX": "passage:",
         "QDRANT_DISTANCE": "DOT",
         "QDRANT_API_KEY": "  ",
         "ITEM_DELAY_SECONDS": "0.5",
@@ -37,6 +42,8 @@ def test_everything_set() -> None:
     assert s.ingest_ebooks is False
     assert s.ebook_max_bytes == 5 * 1024 * 1024
     assert s.embedding_provider == "sentence_transformers"
+    assert s.embedding_query_prefix == "search_query: "
+    assert s.embedding_document_prefix == "passage: "
     assert s.qdrant_distance == "dot"
     assert s.qdrant_api_key is None
     assert s.item_delay_seconds == 0.5

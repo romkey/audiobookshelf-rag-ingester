@@ -29,7 +29,7 @@ def search(
     library_id: str | None = None,
     min_score: float | None = None,
 ) -> list[Hit]:
-    vector = embedder.encode([text])[0]
+    vector = embedder.encode([text], "query")[0]
     return [
         Hit(score, payload)
         for score, payload in store.search(

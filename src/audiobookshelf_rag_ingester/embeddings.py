@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Literal, Protocol
 
 import httpx
 
@@ -11,18 +11,26 @@ logger = logging.getLogger(__name__)
 _CHARS_PER_TOKEN = 4
 
 
+Kind = Literal["document", "query"]
+
+
 class Embedder(Protocol):
-    def encode(self, texts: list[str]) -> list[list[float]]: ...
+    def encode(
+        self, texts: list[str], kind: Kind = "document"
+    ) -> list[list[float]]: ...
 
     @property
     def dimension(self) -> int: ...
 
 
-def truncate(texts: list[str], max_tokens: int) -> list[str]:
-    """Truncate texts that would exceed the model's context length (~4 chars/token)."""
+def truncate(texts: list[str], max_tokens: int, prefix: str = "") -> list[str]:
+    """Truncate texts that would exceed the model's context length (~4 chars/token).
+
+    The prefix is prepended after truncation and counts toward the limit.
+    """
     if max_tokens <= 0:
-        return texts
-    max_chars = max_tokens * _CHARS_PER_TOKEN
+        return [prefix + t for t in texts] if prefix else texts
+    max_chars = max(0, max_tokens * _CHARS_PER_TOKEN - len(prefix))
     result: list[str] = []
     for text in texts:
         if len(text) > max_chars:
@@ -33,12 +41,17 @@ def truncate(texts: list[str], max_tokens: int) -> list[str]:
                 max_tokens,
             )
             text = text[:max_chars]
-        result.append(text)
+        result.append(prefix + text)
     return result
 
 
 class _DimensionMixin:
     _dimension: int | None = None
+    query_prefix: str = ""
+    document_prefix: str = ""
+
+    def _prefix(self, kind: Kind) -> str:
+        return self.query_prefix if kind == "query" else self.document_prefix
 
     @property
     def dimension(self) -> int:
@@ -61,6 +74,8 @@ class OpenAIEmbedder(_DimensionMixin):
     timeout_seconds: int = 120
     max_tokens: int = 0
     batch_size: int = 32
+    query_prefix: str = ""
+    document_prefix: str = ""
     transport: httpx.BaseTransport | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -72,8 +87,8 @@ class OpenAIEmbedder(_DimensionMixin):
             transport=self.transport,
         )
 
-    def encode(self, texts: list[str]) -> list[list[float]]:
-        texts = truncate(texts, self.max_tokens)
+    def encode(self, texts: list[str], kind: Kind = "document") -> list[list[float]]:
+        texts = truncate(texts, self.max_tokens, self._prefix(kind))
         vectors: list[list[float]] = []
         step = max(1, self.batch_size)
         for start in range(0, len(texts), step):
@@ -98,6 +113,8 @@ class SentenceTransformerEmbedder(_DimensionMixin):
     cache_dir: str | None = None
     max_tokens: int = 0
     batch_size: int = 32
+    query_prefix: str = ""
+    document_prefix: str = ""
 
     def __post_init__(self) -> None:
         try:
@@ -110,8 +127,8 @@ class SentenceTransformerEmbedder(_DimensionMixin):
             ) from None
         self._model = SentenceTransformer(self.model_name, cache_folder=self.cache_dir)
 
-    def encode(self, texts: list[str]) -> list[list[float]]:
-        texts = truncate(texts, self.max_tokens)
+    def encode(self, texts: list[str], kind: Kind = "document") -> list[list[float]]:
+        texts = truncate(texts, self.max_tokens, self._prefix(kind))
         vectors = self._model.encode(
             texts, batch_size=self.batch_size, show_progress_bar=False
         )
@@ -126,6 +143,8 @@ def build_embedder(settings: Settings) -> Embedder:
             cache_dir=settings.hf_cache_dir,
             max_tokens=settings.embedding_context_length,
             batch_size=settings.embedding_batch_size,
+            query_prefix=settings.embedding_query_prefix,
+            document_prefix=settings.embedding_document_prefix,
         )
     if provider == "openai":
         return OpenAIEmbedder(
@@ -135,6 +154,8 @@ def build_embedder(settings: Settings) -> Embedder:
             timeout_seconds=max(settings.request_timeout_seconds, 120),
             max_tokens=settings.embedding_context_length,
             batch_size=settings.embedding_batch_size,
+            query_prefix=settings.embedding_query_prefix,
+            document_prefix=settings.embedding_document_prefix,
         )
     raise ValueError(
         f"Unsupported EMBEDDING_PROVIDER '{provider}'. "
