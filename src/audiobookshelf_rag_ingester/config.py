@@ -71,6 +71,12 @@ def _optional(value: str | None) -> str | None:
     return value.strip() if value and value.strip() else None
 
 
+def _prefix(value: str | None) -> str:
+    """An embedding prefix, trimmed and followed by a single space ("" if unset)."""
+    stripped = (value or "").strip()
+    return f"{stripped} " if stripped else ""
+
+
 def _url(name: str, value: str) -> str:
     if not value.startswith(("http://", "https://")):
         raise ConfigError(f"{name} must start with http:// or https://, not {value!r}")
@@ -104,9 +110,11 @@ class Settings:
 
     # Embeddings
     embedding_provider: str = "openai"
-    embedding_model: str = "text-embedding-3-small"
+    embedding_model: str = "nomic-ai/modernbert-embed-base"
     embedding_batch_size: int = 32
     embedding_context_length: int = 8192
+    embedding_query_prefix: str = ""
+    embedding_document_prefix: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str | None = None
     hf_cache_dir: str | None = None
@@ -214,6 +222,8 @@ class Settings:
                 env.get("EMBEDDING_CONTEXT_LENGTH"),
                 cls.embedding_context_length,
             ),
+            embedding_query_prefix=_prefix(env.get("EMBEDDING_QUERY_PREFIX")),
+            embedding_document_prefix=_prefix(env.get("EMBEDDING_DOCUMENT_PREFIX")),
             openai_base_url=_url(
                 "OPENAI_BASE_URL", env.get("OPENAI_BASE_URL") or cls.openai_base_url
             ),

@@ -43,9 +43,11 @@ Booleans accept `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `EMBEDDING_PROVIDER` | `openai` | `openai`, or `sentence_transformers` (install the `sentence-transformers` extra; not in the image) |
-| `EMBEDDING_MODEL` | `text-embedding-3-small` | Model name for the provider. The vector size is detected at startup and must match an existing collection |
+| `EMBEDDING_MODEL` | `nomic-ai/modernbert-embed-base` | Model name for the provider. The vector size is detected at startup and must match an existing collection |
 | `EMBEDDING_BATCH_SIZE` | `32` | Texts per embedding request (≥ 1) |
-| `EMBEDDING_CONTEXT_LENGTH` | `8192` | Max tokens per text. Longer texts (at ~4 characters per token) are truncated. `0` disables truncation |
+| `EMBEDDING_CONTEXT_LENGTH` | `8192` | Max tokens per text, including the prefix. Longer texts (at ~4 characters per token) are truncated. `0` disables truncation |
+| `EMBEDDING_QUERY_PREFIX` | empty | Task prefix added to search queries (`query` command), e.g. `search_query:`. A space is added after it. See `.env.example` for common models |
+| `EMBEDDING_DOCUMENT_PREFIX` | empty | Task prefix added to stored text, e.g. `search_document:`. Changing it changes every vector: run once with `FORCE_REINGEST=true`. Other apps querying Qdrant must add the same query prefix themselves |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API endpoint, or any OpenAI-compatible server (Ollama's `/v1`, LM Studio, vLLM…) |
 | `OPENAI_API_KEY` | none | Optional bearer token. Needed for OpenAI itself, not for local servers without auth |
 | `HF_CACHE_DIR` | none | Model cache for `sentence_transformers` |

@@ -69,9 +69,30 @@ def test_openai_api_key_optional() -> None:
     assert embedder.encode(["a"]) == [[1.0]]
 
 
+def test_prefix_by_kind_counts_toward_limit() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.extend(json.loads(request.content)["input"])
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [1.0]}]})
+
+    embedder = OpenAIEmbedder(
+        model_name="m",
+        query_prefix="q: ",
+        document_prefix="d: ",
+        max_tokens=2,  # 8 chars
+        transport=httpx.MockTransport(handler),
+    )
+    embedder.encode(["abcdefghij"])
+    embedder.encode(["abcdefghij"], "query")
+    assert seen == ["d: abcde", "q: abcde"]
+
+
 def test_truncate() -> None:
     assert truncate(["abcdefghij"], 0) == ["abcdefghij"]
     assert truncate(["abcdefghij", "ab"], 1) == ["abcd", "ab"]
+    assert truncate(["ab"], 0, "p ") == ["p ab"]
+    assert truncate(["abcdefghij"], 1, "abcdef") == ["abcdef"]
 
 
 def test_build_embedder() -> None:

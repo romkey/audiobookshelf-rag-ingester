@@ -199,8 +199,10 @@ class FakeEmbedder:
 
     def __init__(self) -> None:
         self.texts: list[str] = []
+        self.kinds: list[str] = []
 
-    def encode(self, texts: list[str]) -> list[list[float]]:
+    def encode(self, texts: list[str], kind: str = "document") -> list[list[float]]:
+        self.kinds.append(kind)
         self.texts.extend(texts)
         out = []
         for t in texts:

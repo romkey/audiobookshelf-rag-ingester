@@ -108,10 +108,15 @@ audiobookshelf-rag-ingester --version
 import httpx
 from qdrant_client import QdrantClient
 
+# Use the same model and query prefix (EMBEDDING_QUERY_PREFIX) as the ingester;
+# stored vectors were made with the document prefix, queries need the query one.
 vector = httpx.post(
-    "http://localhost:11434/api/embed",
-    json={"model": "nomic-embed-text", "input": ["books narrated by Ray Porter"]},
-).json()["embeddings"][0]
+    "http://localhost:11434/v1/embeddings",
+    json={
+        "model": "nomic-ai/modernbert-embed-base",
+        "input": ["search_query: books narrated by Ray Porter"],
+    },
+).json()["data"][0]["embedding"]
 for hit in (
     QdrantClient("http://localhost:6333")
     .query_points("audiobookshelf", query=vector, limit=5)
@@ -122,7 +127,7 @@ for hit in (
 
 ## Running it
 
-Requires Docker, plus an OpenAI API key (optional for a local OpenAI-compatible server). Configuration comes from environment variables kept in `.env` (see [docs/configuration.md](docs/configuration.md)). At minimum, set `ABS_URL`, `ABS_API_TOKEN` and `OPENAI_API_KEY`:
+Requires Docker, plus a local OpenAI-compatible embedding server (or an OpenAI API key). Configuration comes from environment variables kept in `.env` (see [docs/configuration.md](docs/configuration.md)). At minimum, set `ABS_URL` and `ABS_API_TOKEN`. The embedding model is served by a local OpenAI-compatible server: set `OPENAI_BASE_URL` (and `EMBEDDING_MODEL`, with the query and document prefixes the model expects, listed in `.env.example`). To use OpenAI itself instead, set `OPENAI_API_KEY`, `EMBEDDING_MODEL=text-embedding-3-small` and empty prefixes:
 
 ```bash
 cp .env.example .env   # then edit it

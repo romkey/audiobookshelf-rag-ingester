@@ -8,6 +8,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `EMBEDDING_QUERY_PREFIX` and `EMBEDDING_DOCUMENT_PREFIX` for models that
+  need task prefixes; the default model is `nomic-ai/modernbert-embed-base`.
 - Initial release: syncs Audiobookshelf libraries into Qdrant through the
   ABS REST API. Indexes item metadata, long descriptions, audiobook chapter
   lists, podcast episodes, DRM-free EPUB/PDF text, author documents and
