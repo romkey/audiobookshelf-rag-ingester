@@ -4,26 +4,32 @@ import httpx
 import pytest
 
 from audiobookshelf_rag_ingester.embeddings import (
-    OllamaEmbedder,
+    OpenAIEmbedder,
     build_embedder,
     truncate,
 )
 from tests.fakes import make_settings
 
 
-def _ollama(batch_size: int = 2, max_tokens: int = 0) -> OllamaEmbedder:
+def _openai(batch_size: int = 2, max_tokens: int = 0) -> OpenAIEmbedder:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/embed"
+        assert request.url.path == "/v1/embeddings"
         assert request.headers["Authorization"] == "Bearer key"
         body = json.loads(request.content)
         assert body["model"] == "m"
         return httpx.Response(
-            200, json={"embeddings": [[float(len(t)), 1.0] for t in body["input"]]}
+            200,
+            json={
+                "data": [
+                    {"index": i, "embedding": [float(len(t)), 1.0]}
+                    for i, t in reversed(list(enumerate(body["input"])))
+                ]
+            },
         )
 
-    return OllamaEmbedder(
+    return OpenAIEmbedder(
         model_name="m",
-        ollama_url="http://ollama/",
+        base_url="http://openai/v1/",
         api_key="key",
         batch_size=batch_size,
         max_tokens=max_tokens,
@@ -31,25 +37,36 @@ def _ollama(batch_size: int = 2, max_tokens: int = 0) -> OllamaEmbedder:
     )
 
 
-def test_ollama_batches_and_dimension() -> None:
-    embedder = _ollama(batch_size=2)
+def test_openai_batches_and_dimension() -> None:
+    embedder = _openai(batch_size=2)
     assert embedder.encode(["a", "bb", "ccc"]) == [[1.0, 1.0], [2.0, 1.0], [3.0, 1.0]]
     assert embedder.dimension == 2
 
 
-def test_ollama_truncates() -> None:
-    assert _ollama(max_tokens=1).encode(["x" * 10]) == [[4.0, 1.0]]
+def test_openai_truncates() -> None:
+    assert _openai(max_tokens=1).encode(["x" * 10]) == [[4.0, 1.0]]
 
 
-def test_ollama_bad_response() -> None:
+def test_openai_bad_response() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"nope": True})
 
-    embedder = OllamaEmbedder(
-        model_name="m", ollama_url="http://o", transport=httpx.MockTransport(handler)
+    embedder = OpenAIEmbedder(
+        model_name="m", base_url="http://o/v1", transport=httpx.MockTransport(handler)
     )
-    with pytest.raises(ValueError, match="embeddings"):
+    with pytest.raises(ValueError, match="data"):
         embedder.encode(["a"])
+
+
+def test_openai_api_key_optional() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "Authorization" not in request.headers
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [1.0]}]})
+
+    embedder = OpenAIEmbedder(
+        model_name="m", base_url="http://o/v1", transport=httpx.MockTransport(handler)
+    )
+    assert embedder.encode(["a"]) == [[1.0]]
 
 
 def test_truncate() -> None:
@@ -58,6 +75,6 @@ def test_truncate() -> None:
 
 
 def test_build_embedder() -> None:
-    assert isinstance(build_embedder(make_settings()), OllamaEmbedder)
+    assert isinstance(build_embedder(make_settings()), OpenAIEmbedder)
     with pytest.raises(ValueError, match="Unsupported"):
-        build_embedder(make_settings(embedding_provider="openai"))
+        build_embedder(make_settings(embedding_provider="bogus"))

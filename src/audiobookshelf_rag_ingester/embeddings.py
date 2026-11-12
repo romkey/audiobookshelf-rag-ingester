@@ -48,9 +48,15 @@ class _DimensionMixin:
 
 
 @dataclass
-class OllamaEmbedder(_DimensionMixin):
+class OpenAIEmbedder(_DimensionMixin):
+    """Embeddings from OpenAI, or any server speaking its ``/embeddings`` API.
+
+    The API key is optional so the embedder can also talk to a local
+    OpenAI-compatible server that needs no authentication.
+    """
+
     model_name: str
-    ollama_url: str
+    base_url: str = "https://api.openai.com/v1"
     api_key: str | None = None
     timeout_seconds: int = 120
     max_tokens: int = 0
@@ -60,7 +66,7 @@ class OllamaEmbedder(_DimensionMixin):
     def __post_init__(self) -> None:
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else None
         self._client = httpx.Client(
-            base_url=self.ollama_url.rstrip("/"),
+            base_url=self.base_url.rstrip("/"),
             headers=headers,
             timeout=self.timeout_seconds,
             transport=self.transport,
@@ -73,15 +79,16 @@ class OllamaEmbedder(_DimensionMixin):
         for start in range(0, len(texts), step):
             batch = texts[start : start + step]
             response = self._client.post(
-                "/api/embed", json={"model": self.model_name, "input": batch}
+                "/embeddings", json={"model": self.model_name, "input": batch}
             )
             response.raise_for_status()
-            embeddings = response.json().get("embeddings")
-            if not isinstance(embeddings, list) or len(embeddings) != len(batch):
+            data = response.json().get("data")
+            if not isinstance(data, list) or len(data) != len(batch):
                 raise ValueError(
-                    "Ollama /api/embed response missing or wrong-length 'embeddings'"
+                    "OpenAI /embeddings response missing or wrong-length 'data'"
                 )
-            vectors.extend(embeddings)
+            ordered = sorted(data, key=lambda item: item.get("index", 0))
+            vectors.extend(item["embedding"] for item in ordered)
         return vectors
 
 
@@ -120,16 +127,16 @@ def build_embedder(settings: Settings) -> Embedder:
             max_tokens=settings.embedding_context_length,
             batch_size=settings.embedding_batch_size,
         )
-    if provider == "ollama":
-        return OllamaEmbedder(
+    if provider == "openai":
+        return OpenAIEmbedder(
             model_name=settings.embedding_model,
-            ollama_url=settings.ollama_url,
-            api_key=settings.ollama_api_key,
+            base_url=settings.openai_base_url,
+            api_key=settings.openai_api_key,
             timeout_seconds=max(settings.request_timeout_seconds, 120),
             max_tokens=settings.embedding_context_length,
             batch_size=settings.embedding_batch_size,
         )
     raise ValueError(
         f"Unsupported EMBEDDING_PROVIDER '{provider}'. "
-        "Supported: ollama, sentence_transformers"
+        "Supported: openai, sentence_transformers"
     )

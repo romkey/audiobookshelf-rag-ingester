@@ -42,12 +42,12 @@ Booleans accept `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `EMBEDDING_PROVIDER` | `ollama` | `ollama`, or `sentence_transformers` (install the `sentence-transformers` extra; not in the image) |
-| `EMBEDDING_MODEL` | `nomic-embed-text` | Model name for the provider. The vector size is detected at startup and must match an existing collection |
+| `EMBEDDING_PROVIDER` | `openai` | `openai`, or `sentence_transformers` (install the `sentence-transformers` extra; not in the image) |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | Model name for the provider. The vector size is detected at startup and must match an existing collection |
 | `EMBEDDING_BATCH_SIZE` | `32` | Texts per embedding request (≥ 1) |
 | `EMBEDDING_CONTEXT_LENGTH` | `8192` | Max tokens per text. Longer texts (at ~4 characters per token) are truncated. `0` disables truncation |
-| `OLLAMA_URL` | `http://ollama:11434` | Ollama endpoint |
-| `OLLAMA_API_KEY` | none | Bearer token for a hosted or proxied Ollama |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API endpoint, or any OpenAI-compatible server (Ollama's `/v1`, LM Studio, vLLM…) |
+| `OPENAI_API_KEY` | none | Optional bearer token. Needed for OpenAI itself, not for local servers without auth |
 | `HF_CACHE_DIR` | none | Model cache for `sentence_transformers` |
 
 ## Chunking and scheduling

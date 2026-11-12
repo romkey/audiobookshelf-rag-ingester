@@ -9,7 +9,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-EMBEDDING_PROVIDERS = ("ollama", "sentence_transformers")
+EMBEDDING_PROVIDERS = ("openai", "sentence_transformers")
 DISTANCES = ("cosine", "dot", "euclid", "manhattan")
 
 
@@ -103,12 +103,12 @@ class Settings:
     qdrant_distance: str = "cosine"
 
     # Embeddings
-    embedding_provider: str = "ollama"
-    embedding_model: str = "nomic-embed-text"
+    embedding_provider: str = "openai"
+    embedding_model: str = "text-embedding-3-small"
     embedding_batch_size: int = 32
     embedding_context_length: int = 8192
-    ollama_url: str = "http://ollama:11434"
-    ollama_api_key: str | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_api_key: str | None = None
     hf_cache_dir: str | None = None
 
     # Chunking
@@ -214,8 +214,10 @@ class Settings:
                 env.get("EMBEDDING_CONTEXT_LENGTH"),
                 cls.embedding_context_length,
             ),
-            ollama_url=_url("OLLAMA_URL", env.get("OLLAMA_URL") or cls.ollama_url),
-            ollama_api_key=_optional(env.get("OLLAMA_API_KEY")),
+            openai_base_url=_url(
+                "OPENAI_BASE_URL", env.get("OPENAI_BASE_URL") or cls.openai_base_url
+            ),
+            openai_api_key=_optional(env.get("OPENAI_API_KEY")),
             hf_cache_dir=_optional(env.get("HF_CACHE_DIR")),
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
