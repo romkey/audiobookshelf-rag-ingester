@@ -17,4 +17,5 @@ All notable changes to this project are documented here. The format follows
   and removal of deleted items and libraries.
 - `query` command for searching the collection, and `healthcheck` command
   backed by a heartbeat file.
-- Ollama embeddings by default; SentenceTransformers as an optional extra.
+- OpenAI embeddings by default (optional `OPENAI_API_KEY`, `OPENAI_BASE_URL`
+  for compatible servers); SentenceTransformers as an optional extra.

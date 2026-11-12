@@ -25,7 +25,7 @@ services:
         required: false
     environment:
       QDRANT_URL: http://qdrant:6333
-    # Reach an Ollama running on the Docker host as host.docker.internal.
+    # Reach a local OpenAI-compatible server on the Docker host as host.docker.internal.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

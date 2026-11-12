@@ -2,7 +2,7 @@
 
 **What:** mirrors an Audiobookshelf server (audiobooks, podcasts, attached ebooks) into a Qdrant collection for RAG.
 **Runs as:** worker that syncs every `POLL_INTERVAL_SECONDS` (or once, `--once`). No port; liveness is a heartbeat file.
-**Talks to:** Audiobookshelf REST API (read-only), Ollama (embeddings), Qdrant.
+**Talks to:** Audiobookshelf REST API (read-only), OpenAI embeddings API, Qdrant.
 
 ## Files
 
@@ -13,7 +13,7 @@
 - `documents.py`: pure functions that build chunks (`Document`: key → point id, content hash, payload).
 - `text_utils.py`: HTML stripping, durations, sentence and line chunkers.
 - `extractors.py`: DRM-free EPUB/PDF text extraction.
-- `embeddings.py`: Ollama and SentenceTransformers embedders.
+- `embeddings.py`: OpenAI and SentenceTransformers embedders.
 - `qdrant_store.py`: collection setup, payload indexes, upsert, diff/delete helpers, search.
 - `service.py`: the sync cycle (diff by fingerprint, then content hash; delete what vanished).
 - `heartbeat.py`: heartbeat file for the production health check.

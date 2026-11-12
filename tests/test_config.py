@@ -10,7 +10,7 @@ def test_defaults() -> None:
     assert s.abs_url == "http://abs.local:13378"
     assert s.abs_public_url == s.abs_url
     assert s.abs_libraries == ()
-    assert s.embedding_provider == "ollama"
+    assert s.embedding_provider == "openai"
     assert s.chunk_size == 1200
     assert s.ebook_max_bytes == 100 * 1024 * 1024
     assert s.poll_interval_seconds == 3600
@@ -56,7 +56,7 @@ def test_everything_set() -> None:
         ({**REQUIRED, "INGEST_EBOOKS": "maybe"}, "INGEST_EBOOKS must be true or false"),
         ({**REQUIRED, "ITEM_DELAY_SECONDS": "soon"}, "ITEM_DELAY_SECONDS must be a"),
         ({**REQUIRED, "ITEM_DELAY_SECONDS": "-1"}, "must not be negative"),
-        ({**REQUIRED, "EMBEDDING_PROVIDER": "openai"}, "EMBEDDING_PROVIDER must be"),
+        ({**REQUIRED, "EMBEDDING_PROVIDER": "bogus"}, "EMBEDDING_PROVIDER must be"),
         ({**REQUIRED, "LOG_LEVEL": "LOUD"}, "LOG_LEVEL 'LOUD'"),
     ],
 )

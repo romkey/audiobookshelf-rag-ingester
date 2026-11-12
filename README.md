@@ -5,7 +5,7 @@
 [![Python 3.15](https://img.shields.io/badge/python-3.15-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Mirrors an [Audiobookshelf](https://www.audiobookshelf.org/) server (audiobooks, podcasts and the ebooks attached to them) into a [Qdrant](https://qdrant.tech/) vector store, so a chatbot or other RAG pipeline can answer questions such as "what's a cozy sci-fi audiobook narrated by Ray Porter?", "which podcast episode covered laser cutter safety?" or "how many Discworld books do we have?". It runs as a small worker that re-syncs every hour. Each sync is incremental: it re-embeds only what changed and removes whatever was deleted from Audiobookshelf. Embeddings come from [Ollama](https://ollama.com/).
+Mirrors an [Audiobookshelf](https://www.audiobookshelf.org/) server (audiobooks, podcasts and the ebooks attached to them) into a [Qdrant](https://qdrant.tech/) vector store, so a chatbot or other RAG pipeline can answer questions such as "what's a cozy sci-fi audiobook narrated by Ray Porter?", "which podcast episode covered laser cutter safety?" or "how many Discworld books do we have?". It runs as a small worker that re-syncs every hour. Each sync is incremental: it re-embeds only what changed and removes whatever was deleted from Audiobookshelf. Embeddings come from the [OpenAI API](https://platform.openai.com/docs/guides/embeddings) (or any OpenAI-compatible server).
 
 > **AI disclosure:** This project was written by AI under human oversight,
 > following [these rules](https://github.com/romkey/python-ai-rules/blob/main/RULES.md).
@@ -20,7 +20,7 @@ Mirrors an [Audiobookshelf](https://www.audiobookshelf.org/) server (audiobooks,
 | `src/audiobookshelf_rag_ingester/models.py` | Normalizes Audiobookshelf JSON (books, podcasts, episodes, authors) |
 | `src/audiobookshelf_rag_ingester/documents.py` | Builds the chunks that get embedded, with stable ids and content hashes |
 | `src/audiobookshelf_rag_ingester/extractors.py` | Text from DRM-free EPUB and PDF files |
-| `src/audiobookshelf_rag_ingester/embeddings.py` | Ollama (default) and SentenceTransformers embedders |
+| `src/audiobookshelf_rag_ingester/embeddings.py` | OpenAI (default) and SentenceTransformers embedders |
 | `src/audiobookshelf_rag_ingester/qdrant_store.py` | Qdrant collection, payload indexes, upsert, delete and search |
 | `src/audiobookshelf_rag_ingester/service.py` | The sync loop |
 | `src/audiobookshelf_rag_ingester/query.py` | Search and result formatting for `query` |
@@ -122,7 +122,7 @@ for hit in (
 
 ## Running it
 
-Requires Docker, plus an Ollama server with the embedding model pulled (`ollama pull nomic-embed-text`). Configuration comes from environment variables kept in `.env` (see [docs/configuration.md](docs/configuration.md)). At minimum, set `ABS_URL`, `ABS_API_TOKEN` and `OLLAMA_URL`:
+Requires Docker, plus an OpenAI API key (optional for a local OpenAI-compatible server). Configuration comes from environment variables kept in `.env` (see [docs/configuration.md](docs/configuration.md)). At minimum, set `ABS_URL`, `ABS_API_TOKEN` and `OPENAI_API_KEY`:
 
 ```bash
 cp .env.example .env   # then edit it
@@ -130,7 +130,7 @@ docker compose -f docker-compose.prod.yaml up -d
 docker compose -f docker-compose.prod.yaml logs -f app
 ```
 
-That runs the latest release from `ghcr.io/romkey/audiobookshelf-rag-ingester` alongside Qdrant (on `127.0.0.1:6333`). Set `APP_VERSION=X.Y.Z` to pin a release. To use an existing Qdrant, remove the `qdrant` service from the compose file and set `QDRANT_URL`. For an Ollama on the Docker host, use `OLLAMA_URL=http://host.docker.internal:11434`.
+That runs the latest release from `ghcr.io/romkey/audiobookshelf-rag-ingester` alongside Qdrant (on `127.0.0.1:6333`). Set `APP_VERSION=X.Y.Z` to pin a release. To use an existing Qdrant, remove the `qdrant` service from the compose file and set `QDRANT_URL`. For a local OpenAI-compatible server on the Docker host (such as Ollama), use `OPENAI_BASE_URL=http://host.docker.internal:11434/v1`.
 
 To search from the container:
 
@@ -148,7 +148,7 @@ python3 -m venv ~/.venvs/audiobookshelf-rag-ingester
 ~/.venvs/audiobookshelf-rag-ingester/bin/audiobookshelf-rag-ingester --version
 ```
 
-Set the environment variables yourself (see [docs/configuration.md](docs/configuration.md)); the app doesn't read `.env`. To embed in-process instead of with Ollama, install the `sentence-transformers` extra (it pulls in PyTorch) and set `EMBEDDING_PROVIDER=sentence_transformers`.
+Set the environment variables yourself (see [docs/configuration.md](docs/configuration.md)); the app doesn't read `.env`. To embed in-process instead of with OpenAI, install the `sentence-transformers` extra (it pulls in PyTorch) and set `EMBEDDING_PROVIDER=sentence_transformers`.
 
 ## Development
 

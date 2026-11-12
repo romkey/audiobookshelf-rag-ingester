@@ -13,7 +13,7 @@ classifiers = [
   "Programming Language :: Python :: 3.15",
 ]
 dependencies = [
-  # Audiobookshelf REST API and Ollama embeddings.
+  # Audiobookshelf REST API and OpenAI embeddings.
   "httpx>=0.28.1",
   # Vector store.
   "qdrant-client>=1.20.0",
@@ -25,7 +25,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# In-process embeddings instead of Ollama. Large (PyTorch); not in the image.
+# In-process embeddings instead of OpenAI. Large (PyTorch); not in the image.
 sentence-transformers = ["sentence-transformers>=6.3.0"]
 
 [project.urls]
