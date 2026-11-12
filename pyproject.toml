@@ -1,6 +1,6 @@
 [project]
 name = "audiobookshelf-rag-ingester"
-version = "0.0.0"
+version = "0.1.0"
 description = "Mirrors an Audiobookshelf server (audiobooks, podcasts, ebooks) into Qdrant for RAG."
 readme = "README.md"
 license = "MIT"
