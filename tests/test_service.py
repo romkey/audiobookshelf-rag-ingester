@@ -446,3 +446,41 @@ def test_catalog_point_per_work_and_removal(
     catalog.remove_manifestation("b2")
     catalog.remove_manifestation("b1")
     assert catalog.count() == 0, work_point
+
+
+def test_catalog_refresh_survivor_and_library_removal(
+    abs_client: FakeAbsClient, store: QdrantStore, embedder: FakeEmbedder
+) -> None:
+    from qdrant_client import QdrantClient
+
+    catalog = QdrantStore(collection="cat2", client=QdrantClient(":memory:"))
+    catalog.ensure_collection(vector_size=8, distance="cosine")
+
+    def service() -> IngestionService:
+        return IngestionService(
+            settings=make_settings(),
+            client=abs_client,
+            store=store,
+            catalog_store=catalog,
+            embedder=embedder,
+        )
+
+    abs_client.add(expanded_book("b1"))
+    abs_client.add(expanded_book("b2"))  # same ISBN: a second copy of the work
+    service().run_cycle()
+    (pid,) = _all(catalog)
+    # A changed title is re-embedded into the existing work point.
+    abs_client.add(expanded_book("b2", title="Renamed", updated_at=9))
+    service().run_cycle()
+    assert _all(catalog)[pid]["text"].startswith("Renamed")
+    assert _all(catalog)[pid]["sync_run_id"]
+
+    # Deleting the copy the point names restores the other one.
+    del abs_client.items["b2"]
+    service().run_cycle()
+    assert _all(catalog)[pid]["manifestation_audiobook"]["source_id"] == "b1"
+
+    # Deselecting the library clears its catalog entries.
+    abs_client.libraries = [PODCAST_LIBRARY]
+    service().run_cycle()
+    assert catalog.count() == 0

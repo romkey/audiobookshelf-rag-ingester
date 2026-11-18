@@ -42,8 +42,10 @@ def normalize_title(title: str, series: list[str] | None = None) -> str:
                 flags=re.IGNORECASE,
             )
     # "Title: Subtitle" matches "Title": only the main title is compared.
-    cleaned = cleaned.split(":")[0]
-    return _LEADING_ARTICLE.sub("", _fold(cleaned)).strip()
+    # A series prefix ("Series 1: Title") leaves an empty first part: skip it.
+    parts = [p for p in cleaned.split(":") if _fold(p)]
+    main = parts[0] if parts else cleaned
+    return _LEADING_ARTICLE.sub("", _fold(main)).strip()
 
 
 def normalize_isbn(isbn: str | None) -> str | None:

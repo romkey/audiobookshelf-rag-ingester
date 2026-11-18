@@ -16,6 +16,7 @@ from qdrant_client.models import (
     PayloadSchemaType,
     PointIdsList,
     PointStruct,
+    PointVectors,
     VectorParams,
 )
 
@@ -261,50 +262,87 @@ class QdrantStore:
                 payload,
             )
 
-    def upsert_catalog(self, doc: Document, vector: list[float]) -> None:
-        """Write a work point, keeping manifestations other sources merged in."""
-        if self.client.retrieve(
+    def upsert_catalog(
+        self,
+        doc: Document,
+        vector: list[float],
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Write a work point, keeping manifestations other sources merged in.
+
+        An existing point gets the new vector, text and audiobook manifestation;
+        ``formats`` is the union with whatever other sources recorded.
+        """
+        found = self.client.retrieve(
             collection_name=self.collection,
             ids=[doc.point_id],
-            with_payload=False,
+            with_payload=["formats"],
             with_vectors=False,
-        ):
-            self.client.set_payload(
-                collection_name=self.collection,
-                payload={
-                    "manifestation_audiobook": doc.payload["manifestation_audiobook"]
-                },
-                points=[doc.point_id],
-            )
-            self.client.set_payload(
-                collection_name=self.collection,
-                payload={"audiobook_text": doc.text},
-                points=[doc.point_id],
-            )
+        )
+        if not found:
+            self.upsert([doc], [vector], extra_payload)
             return
-        self.upsert([doc], [vector])
+        formats = sorted(
+            set((found[0].payload or {}).get("formats") or [])
+            | set(doc.payload.get("formats") or [])
+        )
+        now = datetime.now(tz=UTC).isoformat()
+        self.client.update_vectors(
+            collection_name=self.collection,
+            points=[PointVectors(id=doc.point_id, vector=vector)],
+        )
+        self.client.set_payload(
+            collection_name=self.collection,
+            payload={
+                **doc.payload,
+                **(extra_payload or {}),
+                "formats": formats,
+                "chunk_type": doc.chunk_type,
+                "doc_key": doc.key,
+                "text": doc.text,
+                "context": doc.context,
+                "content_hash": doc.content_hash,
+                "ingested_at": now,
+                "indexed_at": now,
+            },
+            points=[doc.point_id],
+        )
 
-    def remove_manifestation(self, source_id: str) -> None:
-        """Drop the audiobook manifestation of a deleted item from its work point."""
+    def remove_manifestation(self, source_id: str) -> list[str]:
+        """Drop an item's audiobook manifestation from its work point.
+
+        Deletes the point when no other format remains. Returns the work ids
+        touched, so the caller can restore a surviving copy of the same work.
+        """
         flt = Filter(must=[_match("manifestation_audiobook.source_id", source_id)])
-        found = self.scroll_ids(flt, ["manifestation_audiobook"])
+        found = self.scroll_ids(flt, ["work_id"])
         for pid in found:
             self.client.delete_payload(
                 collection_name=self.collection,
-                keys=["manifestation_audiobook", "audiobook_text"],
+                keys=["manifestation_audiobook"],
                 points=[pid],
             )
             point = self.client.retrieve(
                 collection_name=self.collection, ids=[pid], with_payload=True
             )
-            others = [
-                k for k in (point[0].payload or {}) if k.startswith("manifestation_")
-            ]
-            if not others:
+            payload = point[0].payload or {}
+            others = [k for k in payload if k.startswith("manifestation_")]
+            if others:
+                self.client.set_payload(
+                    collection_name=self.collection,
+                    payload={
+                        "formats": [
+                            f for f in payload.get("formats", []) if f != "audiobook"
+                        ]
+                    },
+                    points=[pid],
+                )
+            else:
                 self.client.delete(
                     collection_name=self.collection,
                     points_selector=PointIdsList(points=[pid]),
                 )
+        return [str(p["work_id"]) for p in found.values() if p.get("work_id")]
 
     def delete_where(self, flt: Filter) -> None:
         self.client.delete(

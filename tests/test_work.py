@@ -36,3 +36,9 @@ def test_series_in_parentheses_is_stripped() -> None:
 def test_podcasts_are_not_works() -> None:
     assert item_work_id(parse_item(expanded_podcast())) is None
     assert item_work_id(parse_item(expanded_book())) == "isbn:9780062444134"
+
+
+def test_series_prefix_does_not_empty_the_title() -> None:
+    key = normalize_title("Wayfarers 1: The Long Way", ["Wayfarers"])
+    assert key == "long way"
+    assert normalize_title("Wayfarers: The Long Way", ["Wayfarers"]) == "long way"

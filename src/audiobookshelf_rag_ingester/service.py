@@ -55,6 +55,8 @@ from audiobookshelf_rag_ingester.qdrant_store import (
     item_scope,
     library_chunk_scope,
 )
+from audiobookshelf_rag_ingester.text_utils import ms_to_iso
+from audiobookshelf_rag_ingester.work import item_work_id
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +132,6 @@ class IngestionService:
                 s.ingest_ebooks,
                 s.ingest_chapters,
                 s.ingest_episodes,
-                s.library_overview_note,
                 bool(s.qdrant_catalog_collection),
             )
         )
@@ -204,6 +205,9 @@ class IngestionService:
             # Drop libraries that were deleted in ABS or deselected via ABS_LIBRARIES.
             current = {lib.id for lib in libraries}
             for stale_lib in sorted(self.store.library_ids() - current):
+                if self.catalog_store is not None:
+                    for item_id in self.store.item_ids_in_library(stale_lib):
+                        self.catalog_store.remove_manifestation(item_id)
                 logger.info(
                     "Removing points for library %s (no longer present/selected)",
                     stale_lib,
@@ -319,8 +323,7 @@ class IngestionService:
             )
             self.store.delete_items(gone)
             if self.catalog_store is not None:
-                for gone_id in gone:
-                    self.catalog_store.remove_manifestation(gone_id)
+                self._drop_catalog(gone, items, library)
             stats.items_deleted += len(gone)
 
         if self.settings.ingest_authors and library.media_type == "book":
@@ -365,8 +368,25 @@ class IngestionService:
                     "item_fingerprint": item.fingerprint(),
                     "pipeline_signature": self.pipeline_signature,
                     "sync_run_id": self.sync_run_id,
+                    "updated_at": ms_to_iso(item.updated_at),
                 },
             )
+
+    def _drop_catalog(
+        self, gone: list[str], items: list[LibraryItem], library: Library
+    ) -> None:
+        """Remove deleted items' manifestations; restore a surviving copy."""
+        catalog = self.catalog_store
+        if catalog is None:
+            return
+        survivors = {item_work_id(i): i for i in items if item_work_id(i)}
+        for gone_id in gone:
+            for wid in catalog.remove_manifestation(gone_id):
+                survivor = survivors.get(wid)
+                if survivor is not None:
+                    self._sync_catalog(
+                        parse_item(self.client.get_item(survivor.id)), library
+                    )
 
     def _sync_catalog(self, item: LibraryItem, library: Library) -> None:
         if self.catalog_store is None:
@@ -375,7 +395,9 @@ class IngestionService:
         if doc is None:  # podcasts are not works
             return
         vector = self.embedder.encode([doc.context])[0]
-        self.catalog_store.upsert_catalog(doc, vector)
+        self.catalog_store.upsert_catalog(
+            doc, vector, {"sync_run_id": self.sync_run_id}
+        )
 
     def _ebook_documents(
         self, library: Library, item: LibraryItem
@@ -473,3 +495,5 @@ class IngestionService:
         stats.chunks_deleted += self.store.delete_stale(
             scope, set(ids) | (keep_extra or set())
         )
+        if unique:
+            self.store.set_payload(scope, {"sync_run_id": self.sync_run_id})
