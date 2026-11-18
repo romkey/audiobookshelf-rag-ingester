@@ -205,7 +205,7 @@ class IngestionService:
             # Drop libraries that were deleted in ABS or deselected via ABS_LIBRARIES.
             current = {lib.id for lib in libraries}
             for stale_lib in sorted(self.store.library_ids() - current):
-                orphaned: set[str] = set()
+                orphaned: dict[str, dict[str, Any]] = {}
                 if self.catalog_store is not None:
                     for item_id in self.store.item_ids_in_library(stale_lib):
                         orphaned.update(
@@ -376,14 +376,16 @@ class IngestionService:
                 },
             )
 
-    def _restore_catalog(self, work_ids: set[str], libraries: list[Library]) -> None:
+    def _restore_catalog(
+        self, orphaned: dict[str, dict[str, Any]], libraries: list[Library]
+    ) -> None:
         """Re-create catalog points whose work still has a copy in another library."""
         by_id = {lib.id: lib for lib in libraries}
-        for wid in sorted(work_ids):
+        for wid, links in sorted(orphaned.items()):
             for item_id, library_id in self.store.items_for_work(wid):
                 if library_id in by_id:
                     full = parse_item(self.client.get_item(item_id))
-                    self._sync_catalog(full, by_id[library_id])
+                    self._sync_catalog(full, by_id[library_id], links)
                     break
 
     def _drop_catalog(
@@ -395,14 +397,19 @@ class IngestionService:
             return
         survivors = {item_work_id(i): i for i in items if item_work_id(i)}
         for gone_id in gone:
-            for wid in catalog.remove_manifestation(gone_id):
+            for wid, links in catalog.remove_manifestation(gone_id).items():
                 survivor = survivors.get(wid)
                 if survivor is not None:
                     self._sync_catalog(
-                        parse_item(self.client.get_item(survivor.id)), library
+                        parse_item(self.client.get_item(survivor.id)), library, links
                     )
 
-    def _sync_catalog(self, item: LibraryItem, library: Library) -> None:
+    def _sync_catalog(
+        self,
+        item: LibraryItem,
+        library: Library,
+        links: dict[str, Any] | None = None,
+    ) -> None:
         if self.catalog_store is None:
             return
         doc = build_catalog_document(item, library, self.cfg)
@@ -410,7 +417,7 @@ class IngestionService:
             return
         vector = self.embedder.encode([doc.context])[0]
         self.catalog_store.upsert_catalog(
-            doc, vector, {"sync_run_id": self.sync_run_id}
+            doc, vector, {**(links or {}), "sync_run_id": self.sync_run_id}
         )
 
     def _ebook_documents(

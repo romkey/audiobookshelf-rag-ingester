@@ -326,14 +326,15 @@ class QdrantStore:
             points=[doc.point_id],
         )
 
-    def remove_manifestation(self, source_id: str) -> list[str]:
+    def remove_manifestation(self, source_id: str) -> dict[str, dict[str, Any]]:
         """Drop an item's audiobook manifestation from its work point.
 
         Deletes the point when no other format remains. Returns the work ids
-        touched, so the caller can restore a surviving copy of the same work.
+        touched, each with the linker values (topics, asset ids, ...) the point
+        held, so the caller can restore a surviving copy without losing them.
         """
         flt = Filter(must=[_match("manifestation_audiobook.source_id", source_id)])
-        found = self.scroll_ids(flt, ["work_id"])
+        found = self.scroll_ids(flt, ["work_id", *sorted(_SHARED_LINKS)])
         for pid in found:
             self.client.delete_payload(
                 collection_name=self.collection,
@@ -360,7 +361,11 @@ class QdrantStore:
                     collection_name=self.collection,
                     points_selector=PointIdsList(points=[pid]),
                 )
-        return [str(p["work_id"]) for p in found.values() if p.get("work_id")]
+        return {
+            str(p["work_id"]): {k: p[k] for k in _SHARED_LINKS if p.get(k)}
+            for p in found.values()
+            if p.get("work_id")
+        }
 
     def delete_where(self, flt: Filter) -> None:
         self.client.delete(

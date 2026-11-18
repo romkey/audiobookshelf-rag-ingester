@@ -523,3 +523,4 @@ def test_catalog_keeps_linked_fields_and_survives_library_drop(
     abs_client.libraries = [BOOK_LIBRARY]
     service().run_cycle()
     assert catalog.count() == 1
+    assert next(iter(_all(catalog).values()))["topics"] == ["scifi"]
