@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 # Values of the ``source`` payload field this app writes.
 SOURCES = ("audiobook", "podcast")
 
+# Payload keys the linker pass owns; a refresh must not overwrite them.
+_SHARED_LINKS = frozenset(
+    {"topics", "asset_ids", "location_ids", "work_ids", "event_ids", "training_ids"}
+)
+
 # Any: point payloads are free-form JSON that this app writes.
 type Payload = dict[str, Any]
 
@@ -193,6 +198,17 @@ class QdrantStore:
             if payload.get("item_id")
         }
 
+    def items_for_work(self, wid: str) -> list[tuple[str, str]]:
+        """(item_id, library_id) of every indexed audiobook of a work."""
+        flt = Filter(
+            must=[_match("work_ids", wid), _match("chunk_type", "item_metadata")]
+        )
+        return [
+            (str(p["item_id"]), str(p.get("library_id")))
+            for p in self.scroll_ids(flt, ["item_id", "library_id"]).values()
+            if p.get("item_id")
+        ]
+
     def library_ids(self) -> set[str]:
         flt = Filter(
             must=[FieldCondition(key="source", match=MatchAny(any=list(SOURCES)))]
@@ -294,7 +310,9 @@ class QdrantStore:
         self.client.set_payload(
             collection_name=self.collection,
             payload={
-                **doc.payload,
+                # Links other services fill in (topics, asset ids, ...) are not ours
+                # to reset on a refresh.
+                **{k: v for k, v in doc.payload.items() if k not in _SHARED_LINKS},
                 **(extra_payload or {}),
                 "formats": formats,
                 "chunk_type": doc.chunk_type,

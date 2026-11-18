@@ -484,3 +484,42 @@ def test_catalog_refresh_survivor_and_library_removal(
     abs_client.libraries = [PODCAST_LIBRARY]
     service().run_cycle()
     assert catalog.count() == 0
+
+
+def test_catalog_keeps_linked_fields_and_survives_library_drop(
+    abs_client: FakeAbsClient, store: QdrantStore, embedder: FakeEmbedder
+) -> None:
+    from qdrant_client import QdrantClient
+
+    catalog = QdrantStore(collection="cat3", client=QdrantClient(":memory:"))
+    catalog.ensure_collection(vector_size=8, distance="cosine")
+
+    def service() -> IngestionService:
+        return IngestionService(
+            settings=make_settings(),
+            client=abs_client,
+            store=store,
+            catalog_store=catalog,
+            embedder=embedder,
+        )
+
+    other = {"id": "lib-2", "name": "More", "mediaType": "book"}
+    abs_client.libraries = [BOOK_LIBRARY, other]
+    abs_client.add(expanded_book("b1"))
+    copy = expanded_book("b2")
+    copy["libraryId"] = "lib-2"
+    abs_client.add(copy)
+    service().run_cycle()
+    (pid,) = _all(catalog)
+    catalog.client.set_payload("cat3", {"topics": ["scifi"]}, points=[pid])
+    abs_client.add(expanded_book("b2", title="Renamed", updated_at=9))
+    abs_client.items["b2"]["libraryId"] = "lib-2"
+    service().run_cycle()
+    assert _all(catalog)[pid]["topics"] == ["scifi"]
+
+    # Dropping the library the point names restores it from the other library.
+    abs_client.libraries = [BOOK_LIBRARY]
+    abs_client.items = {"b1": abs_client.items["b1"]}
+    abs_client.libraries = [BOOK_LIBRARY]
+    service().run_cycle()
+    assert catalog.count() == 1

@@ -205,14 +205,18 @@ class IngestionService:
             # Drop libraries that were deleted in ABS or deselected via ABS_LIBRARIES.
             current = {lib.id for lib in libraries}
             for stale_lib in sorted(self.store.library_ids() - current):
+                orphaned: set[str] = set()
                 if self.catalog_store is not None:
                     for item_id in self.store.item_ids_in_library(stale_lib):
-                        self.catalog_store.remove_manifestation(item_id)
+                        orphaned.update(
+                            self.catalog_store.remove_manifestation(item_id)
+                        )
                 logger.info(
                     "Removing points for library %s (no longer present/selected)",
                     stale_lib,
                 )
                 self.store.delete_library(stale_lib)
+                self._restore_catalog(orphaned, libraries)
 
         logger.info(
             "Sync finished in %.1fs: libraries=%d items=%d processed=%d unchanged=%d "
@@ -371,6 +375,16 @@ class IngestionService:
                     "updated_at": ms_to_iso(item.updated_at),
                 },
             )
+
+    def _restore_catalog(self, work_ids: set[str], libraries: list[Library]) -> None:
+        """Re-create catalog points whose work still has a copy in another library."""
+        by_id = {lib.id: lib for lib in libraries}
+        for wid in sorted(work_ids):
+            for item_id, library_id in self.store.items_for_work(wid):
+                if library_id in by_id:
+                    full = parse_item(self.client.get_item(item_id))
+                    self._sync_catalog(full, by_id[library_id])
+                    break
 
     def _drop_catalog(
         self, gone: list[str], items: list[LibraryItem], library: Library
