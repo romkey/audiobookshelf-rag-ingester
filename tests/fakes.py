@@ -218,6 +218,8 @@ BASE_SETTINGS = Settings(
     chunk_size=400,
     chunk_overlap=40,
     poll_interval_seconds=0,
+    qdrant_catalog_collection="",
+    ingest_ebooks=True,
 )
 
 

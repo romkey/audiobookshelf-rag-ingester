@@ -18,6 +18,7 @@ import hashlib
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -31,6 +32,7 @@ from audiobookshelf_rag_ingester.documents import (
     Document,
     books_by_author,
     build_author_documents,
+    build_catalog_document,
     build_ebook_documents,
     build_item_documents,
     build_library_summary_documents,
@@ -57,7 +59,7 @@ from audiobookshelf_rag_ingester.qdrant_store import (
 logger = logging.getLogger(__name__)
 
 # Bump when document text/payload layout changes in a way that needs re-ingestion.
-DOCUMENT_SCHEMA_VERSION = "1"
+DOCUMENT_SCHEMA_VERSION = "2"
 SUPPORTED_EBOOK_FORMATS = {"epub", "pdf"}
 
 
@@ -95,11 +97,14 @@ class IngestionService:
         client: AbsSource,
         store: QdrantStore,
         embedder: Embedder,
+        catalog_store: QdrantStore | None = None,
         heartbeat_path: Path | None = None,
     ) -> None:
         self.settings = settings
         self.client = client
         self.store = store
+        self.catalog_store = catalog_store
+        self.sync_run_id = ""
         self.embedder = embedder
         self.heartbeat_path = heartbeat_path
         self.stop_event = threading.Event()
@@ -107,6 +112,7 @@ class IngestionService:
             chunk_size=settings.chunk_size,
             chunk_overlap=settings.chunk_overlap,
             public_url=settings.abs_public_url,
+            overview_note=settings.library_overview_note,
         )
         self.pipeline_signature = self._pipeline_signature()
 
@@ -124,6 +130,8 @@ class IngestionService:
                 s.ingest_ebooks,
                 s.ingest_chapters,
                 s.ingest_episodes,
+                s.library_overview_note,
+                bool(s.qdrant_catalog_collection),
             )
         )
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
@@ -166,6 +174,7 @@ class IngestionService:
 
     def run_cycle(self) -> CycleStats:
         stats = CycleStats()
+        self.sync_run_id = uuid.uuid4().hex
         started = time.monotonic()
         self._beat()
         logger.info(
@@ -249,6 +258,7 @@ class IngestionService:
             ["item_fingerprint", "pipeline_signature"],
         )
 
+        unchanged_ids: list[str] = []
         for idx, item in enumerate(items, 1):
             if self.stop_event.is_set():
                 return  # skip deletions and summaries: we didn't see everything
@@ -259,6 +269,7 @@ class IngestionService:
                 and meta.get("pipeline_signature") == self.pipeline_signature
             ):
                 stats.items_unchanged += 1
+                unchanged_ids.append(item.id)
                 continue
             self._beat()
             logger.info(
@@ -282,14 +293,34 @@ class IngestionService:
         if self.stop_event.is_set():
             return  # stopped during the last item: still skip deletions
 
+        # Mark every unchanged item as seen by this run.
+        self.store.stamp(unchanged_ids, {"sync_run_id": self.sync_run_id})
+
         # Remove items that no longer exist in this library.
         current_ids = {i.id for i in items}
-        gone = sorted(self.store.item_ids_in_library(library.id) - current_ids)
+        previous = self.store.item_ids_in_library(library.id)
+        gone = sorted(previous - current_ids)
+        if gone and len(items) * 2 < len(previous):
+            # Safety valve: a listing under half the size of the last one is
+            # more likely a broken server than a mass deletion.
+            logger.error(
+                "Library %r: listing returned %d items but %d are indexed; "
+                "not deleting %d items. Re-run once the server looks healthy",
+                library.name,
+                len(items),
+                len(previous),
+                len(gone),
+            )
+            stats.errors += 1
+            gone = []
         if gone:
             logger.info(
                 "Library %r: removing %d deleted items", library.name, len(gone)
             )
             self.store.delete_items(gone)
+            if self.catalog_store is not None:
+                for gone_id in gone:
+                    self.catalog_store.remove_manifestation(gone_id)
             stats.items_deleted += len(gone)
 
         if self.settings.ingest_authors and library.media_type == "book":
@@ -324,6 +355,7 @@ class IngestionService:
             docs.extend(ebook_docs)
 
         self._sync_docs(docs, item_scope(item.id), stats, keep_extra=keep_extra)
+        self._sync_catalog(item, library)
 
         # Record the fingerprint last so a failure part-way through is retried.
         if ebook_ok:
@@ -332,8 +364,18 @@ class IngestionService:
                 {
                     "item_fingerprint": item.fingerprint(),
                     "pipeline_signature": self.pipeline_signature,
+                    "sync_run_id": self.sync_run_id,
                 },
             )
+
+    def _sync_catalog(self, item: LibraryItem, library: Library) -> None:
+        if self.catalog_store is None:
+            return
+        doc = build_catalog_document(item, library, self.cfg)
+        if doc is None:  # podcasts are not works
+            return
+        vector = self.embedder.encode([doc.context])[0]
+        self.catalog_store.upsert_catalog(doc, vector)
 
     def _ebook_documents(
         self, library: Library, item: LibraryItem
@@ -424,7 +466,9 @@ class IngestionService:
 
         if changed:
             vectors = self.embedder.encode([d.context for d in changed])
-            stats.chunks_embedded += self.store.upsert(changed, vectors)
+            stats.chunks_embedded += self.store.upsert(
+                changed, vectors, {"sync_run_id": self.sync_run_id}
+            )
 
         stats.chunks_deleted += self.store.delete_stale(
             scope, set(ids) | (keep_extra or set())

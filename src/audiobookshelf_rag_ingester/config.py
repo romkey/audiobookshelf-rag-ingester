@@ -95,17 +95,19 @@ class Settings:
     item_delay_seconds: float = 0.0
 
     # What to index
-    ingest_ebooks: bool = True
+    ingest_ebooks: bool = False
     ebook_max_bytes: int = 100 * 1024 * 1024
     ingest_chapters: bool = True
     ingest_episodes: bool = True
     ingest_authors: bool = True
     ingest_library_summary: bool = True
+    library_overview_note: str = ""
 
     # Qdrant
     qdrant_url: str = "http://qdrant:6333"
     qdrant_api_key: str | None = None
-    qdrant_collection: str = "audiobookshelf"
+    qdrant_collection: str = "hs_member"
+    qdrant_catalog_collection: str = "hs_catalog"
     qdrant_distance: str = "cosine"
 
     # Embeddings
@@ -193,10 +195,16 @@ class Settings:
                 env.get("INGEST_LIBRARY_SUMMARY"),
                 cls.ingest_library_summary,
             ),
+            library_overview_note=(env.get("LIBRARY_OVERVIEW_NOTE") or "")
+            .replace("\\n", "\n")
+            .strip(),
             qdrant_url=_url("QDRANT_URL", env.get("QDRANT_URL") or cls.qdrant_url),
             qdrant_api_key=_optional(env.get("QDRANT_API_KEY")),
             qdrant_collection=(
                 env.get("QDRANT_COLLECTION") or cls.qdrant_collection
+            ).strip(),
+            qdrant_catalog_collection=(
+                env.get("QDRANT_CATALOG_COLLECTION", cls.qdrant_catalog_collection)
             ).strip(),
             qdrant_distance=_choice(
                 "QDRANT_DISTANCE",

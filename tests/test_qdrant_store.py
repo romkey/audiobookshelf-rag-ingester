@@ -6,7 +6,7 @@ from audiobookshelf_rag_ingester.qdrant_store import QdrantStore, item_scope
 
 
 def _doc(key: str, item_id: str = "i1", chunk_type: str = "item_metadata") -> Document:
-    payload = {"source": "audiobookshelf", "library_id": "lib", "item_id": item_id}
+    payload = {"source": "audiobook", "library_id": "lib", "item_id": item_id}
     return Document(key, chunk_type, f"text {key}", f"context {key}", payload)
 
 

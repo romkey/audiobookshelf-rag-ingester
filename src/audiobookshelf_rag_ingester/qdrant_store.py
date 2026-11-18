@@ -23,11 +23,24 @@ from audiobookshelf_rag_ingester.documents import Document
 
 logger = logging.getLogger(__name__)
 
+# Values of the ``source`` payload field this app writes.
+SOURCES = ("audiobook", "podcast")
+
 # Any: point payloads are free-form JSON that this app writes.
 type Payload = dict[str, Any]
 
 _PAYLOAD_INDEXES: dict[str, PayloadSchemaType] = {
     "source": PayloadSchemaType.KEYWORD,
+    "tier": PayloadSchemaType.KEYWORD,
+    "doc_id": PayloadSchemaType.KEYWORD,
+    "asset_ids": PayloadSchemaType.KEYWORD,
+    "location_ids": PayloadSchemaType.KEYWORD,
+    "work_ids": PayloadSchemaType.KEYWORD,
+    "work_id": PayloadSchemaType.KEYWORD,
+    "work_title_key": PayloadSchemaType.KEYWORD,
+    "topics": PayloadSchemaType.KEYWORD,
+    "manifestation_audiobook.source_id": PayloadSchemaType.KEYWORD,
+    "updated_at": PayloadSchemaType.DATETIME,
     "chunk_type": PayloadSchemaType.KEYWORD,
     "library_id": PayloadSchemaType.KEYWORD,
     "media_type": PayloadSchemaType.KEYWORD,
@@ -180,7 +193,9 @@ class QdrantStore:
         }
 
     def library_ids(self) -> set[str]:
-        flt = Filter(must=[_match("source", "audiobookshelf")])
+        flt = Filter(
+            must=[FieldCondition(key="source", match=MatchAny(any=list(SOURCES)))]
+        )
         return {
             str(p.get("library_id"))
             for p in self.scroll_ids(flt, ["library_id"]).values()
@@ -215,6 +230,7 @@ class QdrantStore:
                     "context": doc.context,
                     "content_hash": doc.content_hash,
                     "ingested_at": now,
+                    "indexed_at": now,
                 },
             )
             for doc, vector in zip(docs, vectors, strict=True)
@@ -229,6 +245,66 @@ class QdrantStore:
         self.client.set_payload(
             collection_name=self.collection, payload=payload, points=flt
         )
+
+    def stamp(self, item_ids: Sequence[str], payload: dict[str, Any]) -> None:
+        """Set ``payload`` on every point of the given items, 256 items per call."""
+        for start in range(0, len(item_ids), 256):
+            self.set_payload(
+                Filter(
+                    must=[
+                        FieldCondition(
+                            key="item_id",
+                            match=MatchAny(any=list(item_ids[start : start + 256])),
+                        )
+                    ]
+                ),
+                payload,
+            )
+
+    def upsert_catalog(self, doc: Document, vector: list[float]) -> None:
+        """Write a work point, keeping manifestations other sources merged in."""
+        if self.client.retrieve(
+            collection_name=self.collection,
+            ids=[doc.point_id],
+            with_payload=False,
+            with_vectors=False,
+        ):
+            self.client.set_payload(
+                collection_name=self.collection,
+                payload={
+                    "manifestation_audiobook": doc.payload["manifestation_audiobook"]
+                },
+                points=[doc.point_id],
+            )
+            self.client.set_payload(
+                collection_name=self.collection,
+                payload={"audiobook_text": doc.text},
+                points=[doc.point_id],
+            )
+            return
+        self.upsert([doc], [vector])
+
+    def remove_manifestation(self, source_id: str) -> None:
+        """Drop the audiobook manifestation of a deleted item from its work point."""
+        flt = Filter(must=[_match("manifestation_audiobook.source_id", source_id)])
+        found = self.scroll_ids(flt, ["manifestation_audiobook"])
+        for pid in found:
+            self.client.delete_payload(
+                collection_name=self.collection,
+                keys=["manifestation_audiobook", "audiobook_text"],
+                points=[pid],
+            )
+            point = self.client.retrieve(
+                collection_name=self.collection, ids=[pid], with_payload=True
+            )
+            others = [
+                k for k in (point[0].payload or {}) if k.startswith("manifestation_")
+            ]
+            if not others:
+                self.client.delete(
+                    collection_name=self.collection,
+                    points_selector=PointIdsList(points=[pid]),
+                )
 
     def delete_where(self, flt: Filter) -> None:
         self.client.delete(
