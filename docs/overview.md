@@ -1,6 +1,6 @@
 # Audiobookshelf RAG ingester overview
 
-**What:** mirrors an Audiobookshelf server (audiobooks, podcasts, attached ebooks) into a Qdrant collection for RAG.
+**What:** mirrors an Audiobookshelf server (audiobooks, podcasts) into the member-tier Qdrant collection `hs_member`, plus one `hs_catalog` point per book work, for RAG (PDX Hackerspace pipeline plans 00 and 03). Member tier only: use a dedicated non-admin ABS user; listening progress, sessions, bookmarks and user lists are never read.
 **Runs as:** worker that syncs every `POLL_INTERVAL_SECONDS` (or once, `--once`). No port; liveness is a heartbeat file.
 **Talks to:** Audiobookshelf REST API (read-only), OpenAI embeddings API, Qdrant.
 
@@ -11,6 +11,7 @@
 - `abs_client.py`: ABS REST client (libraries, paginated items, expanded item, authors, ebook download), retries.
 - `models.py`: normalizes minified/expanded ABS JSON into dataclasses; `LibraryItem.fingerprint()`.
 - `documents.py`: pure functions that build chunks (`Document`: key → point id, content hash, payload).
+- `work.py`: `work_id` (ISBN, else normalized title + first author) for cross-format matching.
 - `text_utils.py`: HTML stripping, durations, sentence and line chunkers.
 - `extractors.py`: DRM-free EPUB/PDF text extraction.
 - `embeddings.py`: OpenAI and SentenceTransformers embedders.
@@ -30,6 +31,10 @@
 - The fingerprint is written last, so a failed item is retried next cycle.
 - A stopped (SIGTERM) cycle never deletes anything.
 - Bump `DOCUMENT_SCHEMA_VERSION` in `service.py` when document text or payload layout changes.
+
+- Payload follows the shared layout (`tier`, `authority`, `doc_id`, `work_ids`, `sync_run_id`, ...); `updated_at` is excluded from the content hash.
+- Deletions need a complete listing: a library listing under half the indexed item count deletes nothing.
+- Not here (other services): topic taxonomy mapping, ISBN/ASIN enrichment, the Postgres staging store and catalog table, merging formats into one work point.
 
 ## Conventions
 

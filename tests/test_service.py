@@ -10,6 +10,7 @@ from qdrant_client.models import FieldCondition, Filter, MatchValue
 from audiobookshelf_rag_ingester.qdrant_store import Payload, QdrantStore
 from audiobookshelf_rag_ingester.service import IngestionService
 from tests.fakes import (
+    BOOK_LIBRARY,
     PODCAST_LIBRARY,
     FakeAbsClient,
     FakeEmbedder,
@@ -58,6 +59,11 @@ def _payloads(store: QdrantStore, **match: str) -> list[Payload]:
     )
     fields = ["chunk_type", "item_id", "text", "author_id"]
     return list(store.scroll_ids(flt, fields).values())
+
+
+def _all(s: QdrantStore) -> dict[str, Payload]:
+    points, _ = s.client.scroll(s.collection, limit=1000, with_payload=True)
+    return {str(p.id): p.payload or {} for p in points}
 
 
 def _types(store: QdrantStore, **match: str) -> list[str]:
@@ -364,3 +370,157 @@ def test_run_forever_survives_a_failed_cycle(
     monkeypatch.setattr(service, "run_cycle", failing_cycle)
     service.run_forever()
     assert calls == 2
+
+
+def test_member_tier_payload_and_work_ids(
+    abs_client: FakeAbsClient, store: QdrantStore, make: MakeService
+) -> None:
+    abs_client.add(expanded_book("b1"))
+    abs_client.libraries = [BOOK_LIBRARY, PODCAST_LIBRARY]
+    abs_client.add(expanded_podcast())
+    make().run_cycle()
+    points = _all(store)
+    assert points
+    books = [p for p in points.values() if p.get("item_id") == "b1"]
+    assert {p["tier"] for p in points.values()} == {"member"}
+    assert {p["source"] for p in books} == {"audiobook"}
+    assert all(p["work_ids"] == ["isbn:9780062444134"] for p in books)
+    assert all(p["sync_run_id"] and p["doc_id"] for p in books)
+    pods = [p for p in points.values() if p.get("item_id") == "li-p1"]
+    assert {p["source"] for p in pods} == {"podcast"}
+    assert all(p["work_ids"] == [] for p in pods)
+
+
+def test_no_listening_data_is_staged(
+    abs_client: FakeAbsClient, store: QdrantStore, make: MakeService
+) -> None:
+    book = expanded_book("b1")
+    book["userMediaProgress"] = {"progress": 0.5, "currentTime": 99}
+    book["media"]["metadata"]["bookmarks"] = ["secret"]
+    abs_client.add(book)
+    make().run_cycle()
+    blob = str(_all(store))
+    assert "userMediaProgress" not in blob
+    assert "currentTime" not in blob
+    assert "bookmarks" not in blob
+
+
+def test_safety_valve_blocks_mass_deletion(
+    abs_client: FakeAbsClient, store: QdrantStore, make: MakeService
+) -> None:
+    for n in range(4):
+        abs_client.add(expanded_book(f"b{n}", title=f"Book {n}"))
+    make().run_cycle()
+    for n in range(3):
+        del abs_client.items[f"b{n}"]
+    stats = make().run_cycle()
+    assert stats.items_deleted == 0
+    assert stats.errors == 1
+    assert store.item_ids_in_library("lib-books") == {"b0", "b1", "b2", "b3"}
+
+
+def test_catalog_point_per_work_and_removal(
+    abs_client: FakeAbsClient, store: QdrantStore, embedder: FakeEmbedder
+) -> None:
+    from qdrant_client import QdrantClient
+
+    catalog = QdrantStore(collection="cat", client=QdrantClient(":memory:"))
+    catalog.ensure_collection(vector_size=8, distance="cosine")
+    abs_client.add(expanded_book("b1"))
+    abs_client.add(expanded_book("b2", title="Other Book"))
+    service = IngestionService(
+        settings=make_settings(),
+        client=abs_client,
+        store=store,
+        catalog_store=catalog,
+        embedder=embedder,
+    )
+    service.run_cycle()
+    points = list(_all(catalog).values())
+    assert len(points) == 1  # same ISBN -> same work
+    assert points[0]["manifestation_audiobook"]["format"] == "audiobook"
+    assert points[0]["formats"] == ["audiobook"]
+    assert "Transit" in points[0]["text"]  # chapter titles are embedded text
+
+    work_point = next(iter(_all(catalog)))
+    catalog.remove_manifestation("b2")
+    catalog.remove_manifestation("b1")
+    assert catalog.count() == 0, work_point
+
+
+def test_catalog_refresh_survivor_and_library_removal(
+    abs_client: FakeAbsClient, store: QdrantStore, embedder: FakeEmbedder
+) -> None:
+    from qdrant_client import QdrantClient
+
+    catalog = QdrantStore(collection="cat2", client=QdrantClient(":memory:"))
+    catalog.ensure_collection(vector_size=8, distance="cosine")
+
+    def service() -> IngestionService:
+        return IngestionService(
+            settings=make_settings(),
+            client=abs_client,
+            store=store,
+            catalog_store=catalog,
+            embedder=embedder,
+        )
+
+    abs_client.add(expanded_book("b1"))
+    abs_client.add(expanded_book("b2"))  # same ISBN: a second copy of the work
+    service().run_cycle()
+    (pid,) = _all(catalog)
+    # A changed title is re-embedded into the existing work point.
+    abs_client.add(expanded_book("b2", title="Renamed", updated_at=9))
+    service().run_cycle()
+    assert _all(catalog)[pid]["text"].startswith("Renamed")
+    assert _all(catalog)[pid]["sync_run_id"]
+
+    # Deleting the copy the point names restores the other one.
+    del abs_client.items["b2"]
+    service().run_cycle()
+    assert _all(catalog)[pid]["manifestation_audiobook"]["source_id"] == "b1"
+
+    # Deselecting the library clears its catalog entries.
+    abs_client.libraries = [PODCAST_LIBRARY]
+    service().run_cycle()
+    assert catalog.count() == 0
+
+
+def test_catalog_keeps_linked_fields_and_survives_library_drop(
+    abs_client: FakeAbsClient, store: QdrantStore, embedder: FakeEmbedder
+) -> None:
+    from qdrant_client import QdrantClient
+
+    catalog = QdrantStore(collection="cat3", client=QdrantClient(":memory:"))
+    catalog.ensure_collection(vector_size=8, distance="cosine")
+
+    def service() -> IngestionService:
+        return IngestionService(
+            settings=make_settings(),
+            client=abs_client,
+            store=store,
+            catalog_store=catalog,
+            embedder=embedder,
+        )
+
+    other = {"id": "lib-2", "name": "More", "mediaType": "book"}
+    abs_client.libraries = [BOOK_LIBRARY, other]
+    abs_client.add(expanded_book("b1"))
+    copy = expanded_book("b2")
+    copy["libraryId"] = "lib-2"
+    abs_client.add(copy)
+    service().run_cycle()
+    (pid,) = _all(catalog)
+    catalog.client.set_payload("cat3", {"topics": ["scifi"]}, points=[pid])
+    abs_client.add(expanded_book("b2", title="Renamed", updated_at=9))
+    abs_client.items["b2"]["libraryId"] = "lib-2"
+    service().run_cycle()
+    assert _all(catalog)[pid]["topics"] == ["scifi"]
+
+    # Dropping the library the point names restores it from the other library.
+    abs_client.libraries = [BOOK_LIBRARY]
+    abs_client.items = {"b1": abs_client.items["b1"]}
+    abs_client.libraries = [BOOK_LIBRARY]
+    service().run_cycle()
+    assert catalog.count() == 1
+    assert next(iter(_all(catalog).values()))["topics"] == ["scifi"]

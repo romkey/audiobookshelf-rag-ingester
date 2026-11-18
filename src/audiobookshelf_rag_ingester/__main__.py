@@ -72,6 +72,7 @@ def connect_store(
     settings: Settings,
     vector_size: int,
     *,
+    collection: str | None = None,
     attempts: int = 6,
     sleep: Callable[[float], None] = time.sleep,
 ) -> QdrantStore:
@@ -81,7 +82,7 @@ def connect_store(
             store = QdrantStore(
                 url=settings.qdrant_url,
                 api_key=settings.qdrant_api_key,
-                collection=settings.qdrant_collection,
+                collection=collection or settings.qdrant_collection,
             )
             store.ensure_collection(
                 vector_size=vector_size, distance=settings.qdrant_distance
@@ -117,6 +118,13 @@ def run_sync(
     vector_size = embedder.dimension
     logger.info("Embedding dimension: %d", vector_size)
     store = store or connect_store(settings, vector_size)
+    catalog_store = (
+        connect_store(
+            settings, vector_size, collection=settings.qdrant_catalog_collection
+        )
+        if settings.qdrant_catalog_collection
+        else None
+    )
     with AbsClient(
         base_url=settings.abs_url,
         token=settings.abs_api_token,
@@ -127,6 +135,7 @@ def run_sync(
             settings=settings,
             client=client,
             store=store,
+            catalog_store=catalog_store,
             embedder=embedder,
             heartbeat_path=None if once else heartbeat_path,
         )

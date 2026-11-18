@@ -20,12 +20,13 @@ value stops the app with a message naming the variable.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `INGEST_EBOOKS` | `true` | Download and index the text of DRM-free EPUB and PDF files attached to items |
+| `INGEST_EBOOKS` | `false` | Download and index the text of DRM-free EPUB and PDF files attached to items. Off by default: full book text is not searched in the member collection |
 | `EBOOK_MAX_MB` | `100` | Skip ebook files larger than this (≥ 1) |
 | `INGEST_CHAPTERS` | `true` | Index audiobook chapter lists (skipped when the titles are just "Chapter 1, 2, 3…") |
 | `INGEST_EPISODES` | `true` | Index podcast episodes and show notes |
 | `INGEST_AUTHORS` | `true` | Index an author document per author in book libraries |
 | `INGEST_LIBRARY_SUMMARY` | `true` | Index per-library overview, tallies and catalog |
+| `LIBRARY_OVERVIEW_NOTE` | empty | Text added to the library overview: how to get an account, which apps work. `\n` makes a new line |
 
 Booleans accept `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`.
 
@@ -35,7 +36,8 @@ Booleans accept `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`.
 |----------|---------|---------|
 | `QDRANT_URL` | `http://qdrant:6333` | Qdrant REST endpoint. The compose files set it to their `qdrant` service |
 | `QDRANT_API_KEY` | none | Qdrant API key, if the server requires one |
-| `QDRANT_COLLECTION` | `audiobookshelf` | Collection to write. It's created if missing |
+| `QDRANT_COLLECTION` | `hs_member` | Member-tier collection to write. It's created if missing |
+| `QDRANT_CATALOG_COLLECTION` | `hs_catalog` | One point per book work, listing this source's audiobook manifestation. Empty disables |
 | `QDRANT_DISTANCE` | `cosine` | `cosine`, `dot`, `euclid` or `manhattan`. Only used when the collection is created |
 
 ## Embeddings

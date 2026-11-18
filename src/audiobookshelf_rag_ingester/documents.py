@@ -30,6 +30,7 @@ from audiobookshelf_rag_ingester.text_utils import (
     split_text,
     strip_html,
 )
+from audiobookshelf_rag_ingester.work import item_work_id, series_sequence, work_id
 
 CHUNK_TYPES = (
     "item_metadata",
@@ -39,7 +40,12 @@ CHUNK_TYPES = (
     "ebook_content",
     "author",
     "library_summary",
+    "catalog_work",
 )
+
+TIER = "member"
+# Plan 00 authority scale: 3 asset/geowiki/event, 2 manual/repo/esphome.
+AUTHORITY = 2
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,7 @@ class DocConfig:
     chunk_size: int
     chunk_overlap: int
     public_url: str
+    overview_note: str = ""
 
 
 @dataclass
@@ -63,8 +70,10 @@ class Document:
 
     @property
     def content_hash(self) -> str:
+        # updated_at moves on any ABS touch; it must not force a re-embed.
+        payload = {k: v for k, v in self.payload.items() if k != "updated_at"}
         blob = json.dumps(
-            {"context": self.context, "payload": self.payload},
+            {"context": self.context, "payload": payload},
             sort_keys=True,
             default=str,
         )
@@ -94,7 +103,17 @@ def library_url(public_url: str, library_id: str) -> str:
 
 def _base_payload(library: Library) -> dict[str, Any]:
     return {
-        "source": "audiobookshelf",
+        "source": "podcast" if library.media_type == "podcast" else "audiobook",
+        "tier": TIER,
+        "authority": AUTHORITY,
+        "doc_id": None,
+        "heading_path": None,
+        "asset_ids": [],
+        "location_ids": [],
+        "work_ids": [],
+        "event_ids": [],
+        "training_ids": [],
+        "topics": [],
         "library_id": library.id,
         "library_name": library.name,
         "media_type": library.media_type,
@@ -132,6 +151,7 @@ def _item_payload(
         {
             "media_type": item.media_type,
             "item_id": item.id,
+            "doc_id": item.id,
             "title": item.title,
             "subtitle": item.subtitle,
             "authors": item.authors,
@@ -143,17 +163,95 @@ def _item_payload(
             "published_year": item.published_year,
             "publisher": item.publisher,
             "language": item.language,
+            "lang": item.language,
             "isbn": item.isbn,
             "asin": item.asin,
             "explicit": item.explicit,
+            "abridged": item.abridged,
             "duration_seconds": round(item.duration, 2) if item.duration else None,
             "duration": format_duration(item.duration),
             "has_ebook": bool(item.ebook_format),
             "added_at": ms_to_iso(item.added_at),
+            "created_at": ms_to_iso(item.added_at),
+            "updated_at": ms_to_iso(item.updated_at),
             "url": item_url(cfg.public_url, item.id),
         }
     )
+    wid = item_work_id(item)
+    if wid:
+        payload["work_ids"] = [wid]
+        # Fallback key: an ISBN match is unlikely across formats, titles are not.
+        payload["work_title_key"] = work_id(
+            item.title, item.authors, None, [s.name for s in item.series]
+        )
     return payload
+
+
+def audiobook_manifestation(item: LibraryItem, cfg: DocConfig) -> dict[str, Any]:
+    """The audiobook's entry for the shared work (plan 03 "manifestation")."""
+    seq = series_sequence(item)
+    return {
+        "format": "audiobook",
+        "source": "audiobookshelf",
+        "source_id": item.id,
+        "url": item_url(cfg.public_url, item.id),
+        "duration_seconds": round(item.duration, 2) if item.duration else None,
+        "duration": format_duration(item.duration),
+        "narrators": item.narrators,
+        "abridged": item.abridged,
+        "asin": item.asin,
+        "series": seq[0] if seq else None,
+        "series_sequence": seq[1] if seq else None,
+    }
+
+
+def build_catalog_document(
+    item: LibraryItem, library: Library, cfg: DocConfig
+) -> Document | None:
+    """One ``hs_catalog`` point per work, carrying this source's manifestation.
+
+    The manifestation sits under its own top-level key so another source (ebook,
+    hardcopy) can merge its own key into the same point.
+    """
+    wid = item_work_id(item)
+    if wid is None:
+        return None
+    lines = [_full_title(item)]
+    if item.authors:
+        lines.append(f"By {_join_names(item.authors)}")
+    if item.series:
+        lines.append(f"Series: {', '.join(s.label() for s in item.series)}")
+    lines.append(
+        "Audiobook"
+        + (f", narrated by {_join_names(item.narrators)}" if item.narrators else "")
+        + (f", {format_duration(item.duration)}" if item.duration else "")
+        + (", abridged" if item.abridged else ", unabridged")
+    )
+    if item.genres:
+        lines.append(f"Genres: {', '.join(item.genres)}")
+    description = strip_html(item.description)
+    if description:
+        lines.append(description[: cfg.chunk_size])
+    if chapters_are_meaningful(item.chapters):
+        lines.append("Chapters: " + "; ".join(c.title for c in item.chapters))
+    text = "\n".join(lines)
+    payload = _item_payload(item, library, cfg)
+    payload.update(
+        {
+            "work_id": wid,
+            "chunk_index": 0,
+            "total_chunks": 1,
+            "formats": ["audiobook"],
+            "manifestation_audiobook": audiobook_manifestation(item, cfg),
+        }
+    )
+    return Document(
+        key=f"work:{wid}",
+        chunk_type="catalog_work",
+        text=text,
+        context=text,
+        payload=payload,
+    )
 
 
 def _kind(item: LibraryItem) -> str:
@@ -383,7 +481,12 @@ def build_item_documents(
                     chunk_type="chapters",
                     text=chunk,
                     context=_contextualize(header, chunk),
-                    payload={**base, "chunk_index": idx, "total_chunks": len(chunks)},
+                    payload={
+                        **base,
+                        "heading_path": "Chapters",
+                        "chunk_index": idx,
+                        "total_chunks": len(chunks),
+                    },
                 )
             )
 
@@ -397,6 +500,8 @@ def build_item_documents(
             chunks = split_text(_episode_text(ep), cfg.chunk_size, cfg.chunk_overlap)
             ep_payload = {
                 **base,
+                "doc_id": f"{item.id}:{ep.id}",
+                "heading_path": f"{item.title} > {ep.title}",
                 "episode_id": ep.id,
                 "episode_title": ep.title,
                 "episode_season": ep.season,
@@ -457,6 +562,7 @@ def build_ebook_documents(
                 payload={
                     **base,
                     "section_title": section_title,
+                    "heading_path": section_title,
                     "chunk_index": idx,
                     "total_chunks": len(items),
                 },
@@ -687,7 +793,12 @@ def build_library_summary_documents(
             )
         )
 
+    note = cfg.overview_note.strip()
+    if note:
+        sections.append(("access", f'About the "{lname}" library:', note.splitlines()))
+
     base = _base_payload(library)
+    base["doc_id"] = library.id
     base["url"] = library_url(cfg.public_url, library.id)
     base["title"] = f"{lname} library summary"
 

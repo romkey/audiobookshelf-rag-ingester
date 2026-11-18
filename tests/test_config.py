@@ -70,3 +70,10 @@ def test_everything_set() -> None:
 def test_invalid(env: dict[str, str], message: str) -> None:
     with pytest.raises(ConfigError, match=message):
         Settings.from_env(env)
+
+
+def test_member_tier_defaults() -> None:
+    s = Settings.from_env({"ABS_URL": "http://a", "ABS_API_TOKEN": "t"})
+    assert s.qdrant_collection == "hs_member"
+    assert s.qdrant_catalog_collection == "hs_catalog"
+    assert s.ingest_ebooks is False  # book text is never indexed by default

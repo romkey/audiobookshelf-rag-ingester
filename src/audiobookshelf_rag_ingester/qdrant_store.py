@@ -16,6 +16,7 @@ from qdrant_client.models import (
     PayloadSchemaType,
     PointIdsList,
     PointStruct,
+    PointVectors,
     VectorParams,
 )
 
@@ -23,11 +24,29 @@ from audiobookshelf_rag_ingester.documents import Document
 
 logger = logging.getLogger(__name__)
 
+# Values of the ``source`` payload field this app writes.
+SOURCES = ("audiobook", "podcast")
+
+# Payload keys the linker pass owns; a refresh must not overwrite them.
+_SHARED_LINKS = frozenset(
+    {"topics", "asset_ids", "location_ids", "work_ids", "event_ids", "training_ids"}
+)
+
 # Any: point payloads are free-form JSON that this app writes.
 type Payload = dict[str, Any]
 
 _PAYLOAD_INDEXES: dict[str, PayloadSchemaType] = {
     "source": PayloadSchemaType.KEYWORD,
+    "tier": PayloadSchemaType.KEYWORD,
+    "doc_id": PayloadSchemaType.KEYWORD,
+    "asset_ids": PayloadSchemaType.KEYWORD,
+    "location_ids": PayloadSchemaType.KEYWORD,
+    "work_ids": PayloadSchemaType.KEYWORD,
+    "work_id": PayloadSchemaType.KEYWORD,
+    "work_title_key": PayloadSchemaType.KEYWORD,
+    "topics": PayloadSchemaType.KEYWORD,
+    "manifestation_audiobook.source_id": PayloadSchemaType.KEYWORD,
+    "updated_at": PayloadSchemaType.DATETIME,
     "chunk_type": PayloadSchemaType.KEYWORD,
     "library_id": PayloadSchemaType.KEYWORD,
     "media_type": PayloadSchemaType.KEYWORD,
@@ -179,8 +198,21 @@ class QdrantStore:
             if payload.get("item_id")
         }
 
+    def items_for_work(self, wid: str) -> list[tuple[str, str]]:
+        """(item_id, library_id) of every indexed audiobook of a work."""
+        flt = Filter(
+            must=[_match("work_ids", wid), _match("chunk_type", "item_metadata")]
+        )
+        return [
+            (str(p["item_id"]), str(p.get("library_id")))
+            for p in self.scroll_ids(flt, ["item_id", "library_id"]).values()
+            if p.get("item_id")
+        ]
+
     def library_ids(self) -> set[str]:
-        flt = Filter(must=[_match("source", "audiobookshelf")])
+        flt = Filter(
+            must=[FieldCondition(key="source", match=MatchAny(any=list(SOURCES)))]
+        )
         return {
             str(p.get("library_id"))
             for p in self.scroll_ids(flt, ["library_id"]).values()
@@ -215,6 +247,7 @@ class QdrantStore:
                     "context": doc.context,
                     "content_hash": doc.content_hash,
                     "ingested_at": now,
+                    "indexed_at": now,
                 },
             )
             for doc, vector in zip(docs, vectors, strict=True)
@@ -229,6 +262,110 @@ class QdrantStore:
         self.client.set_payload(
             collection_name=self.collection, payload=payload, points=flt
         )
+
+    def stamp(self, item_ids: Sequence[str], payload: dict[str, Any]) -> None:
+        """Set ``payload`` on every point of the given items, 256 items per call."""
+        for start in range(0, len(item_ids), 256):
+            self.set_payload(
+                Filter(
+                    must=[
+                        FieldCondition(
+                            key="item_id",
+                            match=MatchAny(any=list(item_ids[start : start + 256])),
+                        )
+                    ]
+                ),
+                payload,
+            )
+
+    def upsert_catalog(
+        self,
+        doc: Document,
+        vector: list[float],
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Write a work point, keeping manifestations other sources merged in.
+
+        An existing point gets the new vector, text and audiobook manifestation;
+        ``formats`` is the union with whatever other sources recorded.
+        """
+        found = self.client.retrieve(
+            collection_name=self.collection,
+            ids=[doc.point_id],
+            with_payload=["formats"],
+            with_vectors=False,
+        )
+        if not found:
+            self.upsert([doc], [vector], extra_payload)
+            return
+        formats = sorted(
+            set((found[0].payload or {}).get("formats") or [])
+            | set(doc.payload.get("formats") or [])
+        )
+        now = datetime.now(tz=UTC).isoformat()
+        self.client.update_vectors(
+            collection_name=self.collection,
+            points=[PointVectors(id=doc.point_id, vector=vector)],
+        )
+        self.client.set_payload(
+            collection_name=self.collection,
+            payload={
+                # Links other services fill in (topics, asset ids, ...) are not ours
+                # to reset on a refresh.
+                **{k: v for k, v in doc.payload.items() if k not in _SHARED_LINKS},
+                **(extra_payload or {}),
+                "formats": formats,
+                "chunk_type": doc.chunk_type,
+                "doc_key": doc.key,
+                "text": doc.text,
+                "context": doc.context,
+                "content_hash": doc.content_hash,
+                "ingested_at": now,
+                "indexed_at": now,
+            },
+            points=[doc.point_id],
+        )
+
+    def remove_manifestation(self, source_id: str) -> dict[str, dict[str, Any]]:
+        """Drop an item's audiobook manifestation from its work point.
+
+        Deletes the point when no other format remains. Returns the work ids
+        touched, each with the linker values (topics, asset ids, ...) the point
+        held, so the caller can restore a surviving copy without losing them.
+        """
+        flt = Filter(must=[_match("manifestation_audiobook.source_id", source_id)])
+        found = self.scroll_ids(flt, ["work_id", *sorted(_SHARED_LINKS)])
+        for pid in found:
+            self.client.delete_payload(
+                collection_name=self.collection,
+                keys=["manifestation_audiobook"],
+                points=[pid],
+            )
+            point = self.client.retrieve(
+                collection_name=self.collection, ids=[pid], with_payload=True
+            )
+            payload = point[0].payload or {}
+            others = [k for k in payload if k.startswith("manifestation_")]
+            if others:
+                self.client.set_payload(
+                    collection_name=self.collection,
+                    payload={
+                        "formats": [
+                            f for f in payload.get("formats", []) if f != "audiobook"
+                        ]
+                    },
+                    points=[pid],
+                )
+            else:
+                self.client.delete(
+                    collection_name=self.collection,
+                    points_selector=PointIdsList(points=[pid]),
+                )
+        return {
+            str(p["work_id"]): {k: p[k] for k in _SHARED_LINKS if p.get(k)}
+            for p in found.values()
+            if p.get("work_id")
+        }
 
     def delete_where(self, flt: Filter) -> None:
         self.client.delete(
