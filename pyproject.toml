@@ -1,6 +1,6 @@
 [project]
 name = "audiobookshelf-rag-ingester"
-version = "0.2.0"
+version = "0.3.0"
 description = "Audiobook and podcast source of the PDX Hackerspace RAG pipeline: Audiobookshelf into PostgreSQL and Qdrant."
 readme = "README.md"
 license = "MIT"
