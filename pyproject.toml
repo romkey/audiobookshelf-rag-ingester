@@ -1,7 +1,7 @@
 [project]
 name = "audiobookshelf-rag-ingester"
 version = "0.2.0"
-description = "Mirrors an Audiobookshelf server (audiobooks, podcasts, ebooks) into Qdrant for RAG."
+description = "Audiobook and podcast source of the PDX Hackerspace RAG pipeline: Audiobookshelf into PostgreSQL and Qdrant."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -13,15 +13,18 @@ classifiers = [
   "Programming Language :: Python :: 3.15",
 ]
 dependencies = [
-  # Audiobookshelf REST API and OpenAI embeddings.
+  # Audiobookshelf REST API, the model gateway, Open Library and Google Books.
   "httpx>=0.28.1",
   # Vector store.
   "qdrant-client>=1.20.0",
-  # HTML descriptions and EPUB chapters to text.
+  # HTML descriptions to text.
   "beautifulsoup4>=4.15.0",
-  # Text from attached ebooks.
-  "ebooklib>=0.21",
-  "pypdf>=7.0.1",
+  # Staging store, entity registry and catalog table (shared PostgreSQL).
+  "psycopg[binary]>=3.3.9",
+  "alembic>=1.20.1",
+  "sqlalchemy>=2.1.9",
+  # A local .env for runs outside Docker.
+  "python-dotenv>=1.2.4",
 ]
 
 [project.optional-dependencies]
@@ -46,6 +49,10 @@ dev = [
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.ruff]
+# Same as the pipeline's other ingesters, which share several modules.
+line-length = 100
 
 [tool.ruff.lint]
 select = [
@@ -80,12 +87,18 @@ ignore_missing_imports = true
 addopts = ["--cov", "--cov-report=term-missing", "--strict-markers"]
 testpaths = ["tests"]
 xfail_strict = true
+filterwarnings = [
+  # Tests use Qdrant's in-memory mode, which ignores payload indexes.
+  "ignore:Payload indexes have no effect:UserWarning",
+]
 
 [tool.coverage.run]
 source = ["audiobookshelf_rag_ingester"]
 branch = true
+# Alembic loads migrations by path; tests/test_db.py runs them.
+omit = ["*/audiobookshelf_rag_ingester/migrations/*"]
 
 [tool.coverage.report]
-fail_under = 80
+fail_under = 95
 skip_covered = true
 exclude_also = ['if __name__ == "__main__":']

@@ -5,7 +5,22 @@
 [![Python 3.15](https://img.shields.io/badge/python-3.15-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Mirrors an [Audiobookshelf](https://www.audiobookshelf.org/) server (audiobooks, podcasts and the ebooks attached to them) into a [Qdrant](https://qdrant.tech/) vector store, so a chatbot or other RAG pipeline can answer questions such as "what's a cozy sci-fi audiobook narrated by Ray Porter?", "which podcast episode covered laser cutter safety?" or "how many Discworld books do we have?". It runs as a small worker that re-syncs every hour. Each sync is incremental: it re-embeds only what changed and removes whatever was deleted from Audiobookshelf. Embeddings come from the [OpenAI API](https://platform.openai.com/docs/guides/embeddings) (or any OpenAI-compatible server).
+`audiobookshelf-rag-ingester` is the audiobook and podcast source of the
+PDX Hackerspace RAG pipeline, feeding the member chatbot (member tier only).
+It reads an [Audiobookshelf](https://www.audiobookshelf.org/) server through
+its REST API with a non-admin token, stages every item in PostgreSQL, links
+each audiobook to a cross-format *work* in the shared entity registry (so an
+audiobook and an ebook of the same book are one record), fills gaps from
+Open Library and Google Books, maps items to the shared topic taxonomy with
+a local LLM, and indexes them into Qdrant: one hybrid (dense + keyword)
+point per work in `hs_catalog`, each podcast and episode in `hs_member`,
+and a library overview document in `hs_member`. It also writes the flat
+catalog table that the realtime catalog tool counts and filters (narrator,
+length, genre).
+
+It follows the same pattern, schema and shared code as the ebook source,
+[calibre-web2rag](https://github.com/romkey/pdxhackerspace-calibre-web-rag-injester);
+run both against the same PostgreSQL and Qdrant.
 
 > **AI disclosure:** This project was written by AI under human oversight,
 > following [these rules](https://github.com/romkey/python-ai-rules/blob/main/RULES.md).
@@ -14,138 +29,128 @@ Mirrors an [Audiobookshelf](https://www.audiobookshelf.org/) server (audiobooks,
 
 | Path | What it is |
 |------|------------|
-| `src/audiobookshelf_rag_ingester/__main__.py` | Command line: sync (default), `query`, `healthcheck`; SIGTERM handling |
-| `src/audiobookshelf_rag_ingester/config.py` | Settings from environment variables |
-| `src/audiobookshelf_rag_ingester/abs_client.py` | Read-only Audiobookshelf REST client with retries |
-| `src/audiobookshelf_rag_ingester/models.py` | Normalizes Audiobookshelf JSON (books, podcasts, episodes, authors) |
-| `src/audiobookshelf_rag_ingester/documents.py` | Builds the chunks that get embedded, with stable ids and content hashes |
-| `src/audiobookshelf_rag_ingester/extractors.py` | Text from DRM-free EPUB and PDF files |
-| `src/audiobookshelf_rag_ingester/embeddings.py` | OpenAI (default) and SentenceTransformers embedders |
-| `src/audiobookshelf_rag_ingester/qdrant_store.py` | Qdrant collection, payload indexes, upsert, delete and search |
-| `src/audiobookshelf_rag_ingester/service.py` | The sync loop |
-| `src/audiobookshelf_rag_ingester/query.py` | Search and result formatting for `query` |
-| `src/audiobookshelf_rag_ingester/heartbeat.py` | Heartbeat file behind the container health check |
-| `tests/` | pytest; full sync runs against an in-memory Qdrant and a fake Audiobookshelf |
+| `src/audiobookshelf_rag_ingester/__main__.py` | Command line: `run`, `migrate`, `status`; logging, SIGTERM, exit codes |
+| `src/audiobookshelf_rag_ingester/config.py` | Settings from environment variables, validated at startup |
+| `src/audiobookshelf_rag_ingester/pipeline.py` | One sync run: staging, registry, indexing, reconcile |
+| `src/audiobookshelf_rag_ingester/abs_client.py`, `models.py` | Read-only Audiobookshelf client; normalized items |
+| `src/audiobookshelf_rag_ingester/documents.py` | Point IDs, the shared payload, catalog, overview and podcast text |
+| `src/audiobookshelf_rag_ingester/db.py`, `migrations/` | PostgreSQL queries; Alembic schema |
+| `src/audiobookshelf_rag_ingester/works.py` | ISBN normalization, `work_id`, title similarity, audiobook title cleanup |
+| `src/audiobookshelf_rag_ingester/sanitize.py` | Deterministic secret scanner and redaction |
+| `src/audiobookshelf_rag_ingester/enrichment.py` | Open Library and Google Books lookups |
+| `src/audiobookshelf_rag_ingester/llm.py` | Ingest-time LLM tasks through the gateway, cached by input hash |
+| `src/audiobookshelf_rag_ingester/linker.py` | Links chunks to registry entities by alias |
+| `src/audiobookshelf_rag_ingester/embeddings.py`, `sparse.py` | Dense embedders; keyword (sparse) vectors |
+| `src/audiobookshelf_rag_ingester/qdrant_store.py` | Hybrid collections, payload indexes, upserts, reconcile |
+| `src/audiobookshelf_rag_ingester/taxonomy.txt` | The shared topic taxonomy |
+| `tests/` | pytest against real PostgreSQL, in-memory Qdrant and a fake Audiobookshelf |
 | `docs/configuration.md` | Every environment variable |
-| `docs/overview.md` | Short map of the code and its invariants |
+| `docs/overview.md` | Short architecture summary and what is shared with the ebook source |
 
 ## Technical details
 
-### How it talks to Audiobookshelf
-
-It uses the REST API with a Bearer token, not the database. Audiobookshelf's SQLite schema is internal and changes between releases. The API is stable, works when Audiobookshelf runs on another host, and respects the token user's library permissions. The ingester calls only these read-only endpoints:
-
-| Endpoint | Used for |
-|----------|----------|
-| `GET /api/libraries` | Libraries and their media type (book or podcast) |
-| `GET /api/libraries/:id/items?minified=1` | Paginated item list: cheap change detection |
-| `GET /api/items/:id?expanded=1` | Full item (chapters, episodes, ebook file), only for items that changed |
-| `GET /api/libraries/:id/authors` | Author names and bios |
-| `GET /api/items/:id/ebook` | The item's ebook file, only when it changed |
-
-### What gets indexed
-
-Each Qdrant point has a `chunk_type`:
-
-| `chunk_type` | One per | Contents |
-|--------------|---------|----------|
-| `item_metadata` | book or podcast | Title, authors, narrators, series, genres, tags, year, publisher, length, chapter count, ISBN/ASIN, start of the description |
-| `description` | book or podcast with a long blurb | The rest of the description, chunked |
-| `chapters` | audiobook | Chapter titles with start times and lengths (skipped for "Chapter 1, 2, 3…") |
-| `episode` | podcast episode | Title, season and number, date, length, chapter titles, show notes |
-| `ebook_content` | chunk of an attached ebook | Text of DRM-free EPUB/PDF files, with section titles |
-| `author` | author in a book library | The author's books in the library, then their bio |
-| `library_summary` | library | Counts, author/narrator/series/genre tallies, full catalog |
-
-The embedded text (`context`) of each chunk starts with a header such as `Audiobook: Title: Subtitle | By: Author | Narrated by: Narrator | Series: Name #2`, so every retrieved chunk carries its source.
-
-### Incremental sync and reindexing
-
-1. **Item fingerprint.** Each item's `updatedAt`, `mtimeMs`, size, chapter count, episode count and ebook format (all in the cheap list call) are compared with the values stored in Qdrant. If nothing changed, the item isn't fetched at all.
-2. **Content hash.** For a changed item, only chunks whose text or payload changed are embedded. The item's other points (a shorter description, a removed episode) are deleted.
-3. **Ebook signature.** An ebook is downloaded again only when its file (inode, size, mtime) or the item's title, authors or series change.
-4. **Deletions.** Items and libraries that are gone from Audiobookshelf, or excluded by `ABS_LIBRARIES`, are removed. A sync stopped part-way (SIGTERM) deletes nothing.
-
-You don't need an external reindex job:
-
-| Change | What happens |
-|--------|--------------|
-| Edit metadata, add episodes, replace an ebook | Picked up on the next sync |
-| Change `EMBEDDING_MODEL`, `EMBEDDING_PROVIDER`, `CHUNK_SIZE`, `CHUNK_OVERLAP`, `ABS_PUBLIC_URL` or `INGEST_EBOOKS`/`_CHAPTERS`/`_EPISODES` | Every item is rebuilt on the next sync |
-| A model with a different vector size | Startup fails. Set a new `QDRANT_COLLECTION` or delete the old one |
-| Anything else | Run once with `FORCE_REINGEST=true` |
-
-Qdrant maintains its own vector and payload indexes, so there's nothing to rebuild there.
-
-### Payload fields
-
-Every point has `source` (`"audiobookshelf"`), `chunk_type`, `library_id`, `library_name`, `media_type`, `url` (a link into the Audiobookshelf web UI), `text` (the raw chunk), `context` (what was embedded; use this for LLM grounding), `chunk_index`, `total_chunks`, `content_hash`, `doc_key` and `ingested_at`.
-
-The other fields depend on the chunk type:
-
-- **Item chunks:** `item_id`, `title`, `subtitle`, `authors`, `narrators`, `series`, `series_labels`, `genres`, `tags`, `published_year`, `publisher`, `language`, `isbn`, `asin`, `explicit`, `duration_seconds`, `duration`, `has_ebook`, `added_at`, `item_fingerprint`, `pipeline_signature`.
-- **Episodes:** also `episode_id`, `episode_title`, `episode_season`, `episode_number`, `episode_published_at`.
-- **Ebook chunks:** also `section_title`, `ebook_format`, `ebook_filename`, `ebook_signature`.
-- **Authors:** `author_id`, `author_name`, `book_count`.
-- **Summaries:** `summary_section` (`overview`, `authors`, `narrators`, `series`, `genres`, `catalog`).
-
-These fields have keyword indexes for filtering: `source`, `chunk_type`, `library_id`, `media_type`, `item_id`, `episode_id`, `author_id`, `authors`, `narrators`, `series`, `genres`, `tags`, `language` and `published_year`. `episode_published_at` has a datetime index.
-
-### Command line
+Command line:
 
 ```bash
-audiobookshelf-rag-ingester                 # sync every POLL_INTERVAL_SECONDS
-audiobookshelf-rag-ingester --once          # sync once; exit 2 if any item failed
-audiobookshelf-rag-ingester query "cozy science fiction about a ship crew"
-audiobookshelf-rag-ingester query --type episode --show-text "laser cutter safety"
-audiobookshelf-rag-ingester healthcheck     # exit 0 while the sync loop is alive
+audiobookshelf-rag-ingester run --mode incremental   # hourly: changed (updatedAt) and deleted items
+audiobookshelf-rag-ingester run --mode full          # nightly: every item, then delete what wasn't seen
+audiobookshelf-rag-ingester run --mode reindex       # rebuild every point from staging, no ABS read
+audiobookshelf-rag-ingester status                   # recent runs, quarantine and catalog counts (JSON)
+audiobookshelf-rag-ingester migrate                  # only apply schema migrations
 audiobookshelf-rag-ingester --version
 ```
 
-### Querying from your own code
+`audiobookshelf-rag-ingester` alone is `run --mode full`. Every command first
+applies pending PostgreSQL migrations. Exit codes: 0 on success (including a
+clean stop on SIGTERM, and a run skipped because another holds the lock), 1
+if the run fails, the safety valve held back deletions or a library's
+listing failed, 2 for invalid configuration.
 
-```python
-import httpx
-from qdrant_client import QdrantClient
+**Access.** Use a dedicated Audiobookshelf user that is not an admin and
+can see the libraries to index, and its API token. The ingester calls only
+`GET /api/libraries`, `GET /api/libraries/:id/items` (minified, paginated)
+and `GET /api/items/:id?expanded=1`. It never reads listening progress,
+sessions, bookmarks or user lists, and none of those reach staging.
 
-# Use the same model and query prefix (EMBEDDING_QUERY_PREFIX) as the ingester;
-# stored vectors were made with the document prefix, queries need the query one.
-vector = httpx.post(
-    "http://localhost:11434/v1/embeddings",
-    json={
-        "model": "nomic-ai/modernbert-embed-base",
-        "input": ["search_query: books narrated by Ray Porter"],
-    },
-).json()["data"][0]["embedding"]
-for hit in (
-    QdrantClient("http://localhost:6333")
-    .query_points("audiobookshelf", query=vector, limit=5)
-    .points
-):
-    print(hit.score, hit.payload["title"], hit.payload["url"])
-```
+**What a run does.** For every item in the selected libraries it stages
+title, subtitle, authors, narrators, series and sequence, publisher, year,
+language, ISBN and ASIN, description (HTML cleaned to text), genres, tags,
+explicit and abridged flags, duration, chapter titles, number of audio
+files, cover path and date added; for podcasts, each episode's title, show
+notes, date and duration. Secrets are redacted and logged to the
+`quarantine` table. Missing descriptions or genres are looked up (Open
+Library, then Google Books, by ISBN or title and author) and stored apart
+from library data with their origin. With `LLM_MODEL` set, an LLM maps each
+item to 1–5 slugs of the shared taxonomy and, when an audiobook's
+description is missing or marketing copy, writes a "what this book is good
+for" summary, marked machine-generated. LLM results are cached by input hash.
+
+**Works.** An audiobook's `work_id` is computed exactly as the ebook source
+computes it: `isbn:<ISBN-13>`, else `title:<normalized-title>--<surname>`.
+"(Unabridged)" and series markers ("Wayfarers 1: …", "…: The Expanse, Book
+1") are stripped first. If no work has that ID, the audiobook is matched
+against other sources' works by the first author's surname and title
+similarity: 0.93 or more merges, 0.80 or more merges when the series and
+sequence also agree, otherwise it is queued in `registry_review_queue`.
+Decisions are kept in `registry_merges`. Each audiobook is attached as a
+manifestation `{format: audiobook, source: audiobookshelf, source_id, url,
+duration, narrators}`; an Audiobookshelf item with no audio counts as an
+`ebook` manifestation.
+
+**What gets indexed.**
+
+| Collection | `source` | One point per | Text |
+|------------|----------|---------------|------|
+| `hs_catalog` | `catalog` | work (every format) | Title, authors, series and number, formats, narrators, length, topics, tags, description or summary, contents, audiobook chapter titles |
+| `hs_member` | `podcast` | podcast, plus long-description chunks | Title, hosts, genres, topics, episode count, description |
+| `hs_member` | `podcast` | episode chunk | Episode title, podcast, season and number, date, length, show notes |
+| `hs_member` | `audiobookshelf` | overview section | Size and hours, strongest topics and genres, how to get an account, which apps work |
+
+Every point carries the shared payload (`id` = uuid5 of source, doc and
+chunk index; `doc_id`, `chunk_index`, `title`, `heading_path`, `text`,
+`context`, `url`, `tier: member`, `authority: 2`, timestamps,
+`content_hash`, `sync_run_id`, `asset_ids`, `location_ids`, `work_ids`,
+`event_ids`, `training_ids`, `topics`, `lang`). Catalog points add
+`work_id`, `authors`, `series`, `series_index`, `formats`, `narrators`,
+`duration_seconds` and `manifestations`, so series queries sort by
+`series_index` across formats. Podcast points add `item_id`, `kind`
+(`podcast` or `episode`), `episode_id`, `published_at` and
+`duration_seconds`.
+
+**Catalog table.** Each audiobook is a row in `catalog_items` (format
+`audiobook`) with `narrators`, `duration_seconds`, `genres`, `abridged`,
+`series` and `series_index` besides the shared columns; counts and filters
+such as "audiobooks under five hours" are answered from it, never from the
+index.
+
+**Sync.** `incremental` fetches only items whose `updatedAt` changed;
+`full` fetches every item and deletes `hs_member` points this source wrote
+that the run didn't see. Unchanged text is never re-embedded. A run that
+sees less than half the items of the last full run (or of staging) deletes
+nothing and exits 1; nothing is deleted for a library whose listing failed.
 
 ## Running it
 
-Requires Docker, plus a local OpenAI-compatible embedding server (or an OpenAI API key). Configuration comes from environment variables kept in `.env` (see [docs/configuration.md](docs/configuration.md)). At minimum, set `ABS_URL` and `ABS_API_TOKEN`. The embedding model is served by a local OpenAI-compatible server: set `OPENAI_BASE_URL` (and `EMBEDDING_MODEL`, with the query and document prefixes the model expects, listed in `.env.example`). To use OpenAI itself instead, set `OPENAI_API_KEY`, `EMBEDDING_MODEL=text-embedding-3-small` and empty prefixes:
+Requires Docker, an Audiobookshelf token for a non-admin user, PostgreSQL
+and Qdrant (shared with the pipeline's other sources), and an
+OpenAI-compatible embedding server. Configuration comes from `.env` (see
+[docs/configuration.md](docs/configuration.md)).
 
 ```bash
 cp .env.example .env   # then edit it
-docker compose -f docker-compose.prod.yaml up -d
-docker compose -f docker-compose.prod.yaml logs -f app
+docker compose -f docker-compose.prod.yaml run --rm app
 ```
 
-That runs the latest release from `ghcr.io/romkey/audiobookshelf-rag-ingester` alongside Qdrant (on `127.0.0.1:6333`). Set `APP_VERSION=X.Y.Z` to pin a release. To use an existing Qdrant, remove the `qdrant` service from the compose file and set `QDRANT_URL`. For a local OpenAI-compatible server on the Docker host (such as Ollama), use `OPENAI_BASE_URL=http://host.docker.internal:11434/v1`.
-
-To search from the container:
-
-```bash
-docker compose -f docker-compose.prod.yaml exec app audiobookshelf-rag-ingester query "space opera"
-```
+That runs one full sync with the latest release from
+`ghcr.io/romkey/audiobookshelf-rag-ingester`, plus PostgreSQL and Qdrant.
+To use the pipeline's existing PostgreSQL and Qdrant, delete those services
+from the compose file and set `DATABASE_URL` and `QDRANT_URL`. Schedule it
+from cron (see the comments in `docker-compose.prod.yaml`): `incremental`
+hourly, `full` nightly. Set `APP_VERSION=X.Y.Z` to pin a release.
 
 ### With pip
 
-Needs Python 3.15 or newer. Install into a virtual environment from a release's wheel (or `pip install audiobookshelf-rag-ingester` if it's published on PyPI):
+Needs Python 3.15 or newer:
 
 ```bash
 python3 -m venv ~/.venvs/audiobookshelf-rag-ingester
@@ -153,41 +158,25 @@ python3 -m venv ~/.venvs/audiobookshelf-rag-ingester
 ~/.venvs/audiobookshelf-rag-ingester/bin/audiobookshelf-rag-ingester --version
 ```
 
-Set the environment variables yourself (see [docs/configuration.md](docs/configuration.md)); the app doesn't read `.env`. To embed in-process instead of with OpenAI, install the `sentence-transformers` extra (it pulls in PyTorch) and set `EMBEDDING_PROVIDER=sentence_transformers`.
-
 ## Development
 
 With Docker, nothing else to install:
 
 ```bash
-docker compose up --build                                  # run from the working tree, with Qdrant
-docker compose -f docker-compose.test.yaml run --rm test   # tests with coverage
+docker compose up --build                                  # one full sync from the working tree
+docker compose -f docker-compose.test.yaml run --rm test   # tests with coverage, against PostgreSQL
 docker compose -f docker-compose.lint.yaml run --rm lint   # every lint check, as CI runs them
 ```
 
-With [uv](https://docs.astral.sh/uv/), which installs the exact versions CI tests (`uv.lock`):
+With [uv](https://docs.astral.sh/uv/) and a PostgreSQL you can reach:
 
 ```bash
 uv sync
-uv run pytest
+DATABASE_URL=postgresql://app:app@localhost:5432/app uv run pytest
 uv run mypy
-uv run audiobookshelf-rag-ingester --once
 ```
 
-With pip (25.1 or newer, for `--group`). pip doesn't read `uv.lock`, so it may pick newer dependency versions than CI tested:
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e . --group dev
-pytest
-mypy
-audiobookshelf-rag-ingester --once
-```
-
-Either way, `uvx pre-commit install` (or `pip install pre-commit && pre-commit install`) runs the lint checks on every commit.
-
-The tests need no services: the sync loop runs against Qdrant's in-memory mode and a fake Audiobookshelf.
+`uvx pre-commit install` runs the lint checks on every commit.
 
 ## License
 

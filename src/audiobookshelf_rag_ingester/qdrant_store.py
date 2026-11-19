@@ -1,440 +1,284 @@
+"""Qdrant collections with a dense and a sparse (keyword) vector per point."""
+
+from __future__ import annotations
+
 import logging
-from collections.abc import Sequence
-from datetime import UTC, datetime
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Condition,
-    Distance,
-    ExtendedPointId,
-    FieldCondition,
-    Filter,
-    FilterSelector,
-    MatchAny,
-    MatchValue,
-    PayloadSchemaType,
-    PointIdsList,
-    PointStruct,
-    PointVectors,
-    VectorParams,
-)
-
-from audiobookshelf_rag_ingester.documents import Document
+from qdrant_client import models as qm
 
 logger = logging.getLogger(__name__)
 
-# Values of the ``source`` payload field this app writes.
-SOURCES = ("audiobook", "podcast")
+DENSE = "dense"
+SPARSE = "sparse"
 
-# Payload keys the linker pass owns; a refresh must not overwrite them.
-_SHARED_LINKS = frozenset(
-    {"topics", "asset_ids", "location_ids", "work_ids", "event_ids", "training_ids"}
-)
-
-# Any: point payloads are free-form JSON that this app writes.
-type Payload = dict[str, Any]
-
-_PAYLOAD_INDEXES: dict[str, PayloadSchemaType] = {
-    "source": PayloadSchemaType.KEYWORD,
-    "tier": PayloadSchemaType.KEYWORD,
-    "doc_id": PayloadSchemaType.KEYWORD,
-    "asset_ids": PayloadSchemaType.KEYWORD,
-    "location_ids": PayloadSchemaType.KEYWORD,
-    "work_ids": PayloadSchemaType.KEYWORD,
-    "work_id": PayloadSchemaType.KEYWORD,
-    "work_title_key": PayloadSchemaType.KEYWORD,
-    "topics": PayloadSchemaType.KEYWORD,
-    "manifestation_audiobook.source_id": PayloadSchemaType.KEYWORD,
-    "updated_at": PayloadSchemaType.DATETIME,
-    "chunk_type": PayloadSchemaType.KEYWORD,
-    "library_id": PayloadSchemaType.KEYWORD,
-    "media_type": PayloadSchemaType.KEYWORD,
-    "item_id": PayloadSchemaType.KEYWORD,
-    "episode_id": PayloadSchemaType.KEYWORD,
-    "author_id": PayloadSchemaType.KEYWORD,
-    "authors": PayloadSchemaType.KEYWORD,
-    "narrators": PayloadSchemaType.KEYWORD,
-    "series": PayloadSchemaType.KEYWORD,
-    "genres": PayloadSchemaType.KEYWORD,
-    "tags": PayloadSchemaType.KEYWORD,
-    "language": PayloadSchemaType.KEYWORD,
-    "published_year": PayloadSchemaType.KEYWORD,
-    "episode_published_at": PayloadSchemaType.DATETIME,
+# Payload indexes every text collection gets (shared architecture), plus
+# the catalog's own filter fields.
+COMMON_INDEXES: dict[str, qm.PayloadSchemaType] = {
+    "source": qm.PayloadSchemaType.KEYWORD,
+    "tier": qm.PayloadSchemaType.KEYWORD,
+    "doc_id": qm.PayloadSchemaType.KEYWORD,
+    "asset_ids": qm.PayloadSchemaType.KEYWORD,
+    "location_ids": qm.PayloadSchemaType.KEYWORD,
+    "topics": qm.PayloadSchemaType.KEYWORD,
+    "section": qm.PayloadSchemaType.KEYWORD,
+    "updated_at": qm.PayloadSchemaType.DATETIME,
+    "sync_run_id": qm.PayloadSchemaType.KEYWORD,
+}
+CATALOG_INDEXES: dict[str, qm.PayloadSchemaType] = {
+    "work_id": qm.PayloadSchemaType.KEYWORD,
+    "authors": qm.PayloadSchemaType.KEYWORD,
+    "formats": qm.PayloadSchemaType.KEYWORD,
+    "languages": qm.PayloadSchemaType.KEYWORD,
+    "series": qm.PayloadSchemaType.KEYWORD,
+    "tags": qm.PayloadSchemaType.KEYWORD,
+    "year": qm.PayloadSchemaType.INTEGER,
+    "narrators": qm.PayloadSchemaType.KEYWORD,
+}
+# Podcast points in hs_member: per-podcast cleanup and episode filters.
+PODCAST_INDEXES: dict[str, qm.PayloadSchemaType] = {
+    "item_id": qm.PayloadSchemaType.KEYWORD,
+    "kind": qm.PayloadSchemaType.KEYWORD,
+    "published_at": qm.PayloadSchemaType.DATETIME,
 }
 
 
-def _distance(name: str) -> Distance:
+class CollectionMismatchError(RuntimeError):
+    """An existing collection was built with a different model or layout."""
+
+
+def _distance(name: str) -> qm.Distance:
     match name.lower():
         case "cosine":
-            return Distance.COSINE
+            return qm.Distance.COSINE
         case "dot":
-            return Distance.DOT
+            return qm.Distance.DOT
         case "euclid":
-            return Distance.EUCLID
-        case "manhattan":
-            return Distance.MANHATTAN
+            return qm.Distance.EUCLID
         case _:
             raise ValueError(f"Unsupported Qdrant distance metric: {name}")
 
 
-def _match(key: str, value: Any) -> FieldCondition:
-    return FieldCondition(key=key, match=MatchValue(value=value))
+def _match(key: str, value: str) -> qm.FieldCondition:
+    return qm.FieldCondition(key=key, match=qm.MatchValue(value=value))
 
 
 class QdrantStore:
+    """One collection. ``metadata`` records the embedding model and encoders."""
+
     def __init__(
         self,
         *,
+        client: QdrantClient,
         collection: str,
-        url: str | None = None,
-        api_key: str | None = None,
-        client: QdrantClient | None = None,
+        vector_size: int,
+        distance: str,
+        # Any: collection metadata is free-form JSON.
+        metadata: Mapping[str, Any],
+        indexes: Mapping[str, qm.PayloadSchemaType] = COMMON_INDEXES,
     ) -> None:
+        self.client = client
         self.collection = collection
-        self.client = client or QdrantClient(url=url, api_key=api_key)
+        self._ensure(vector_size, distance, dict(metadata), indexes)
 
-    # ------------------------------------------------------------------
-    # Collection setup
-    # ------------------------------------------------------------------
-
-    def ensure_collection(self, *, vector_size: int, distance: str) -> None:
+    def _ensure(
+        self,
+        vector_size: int,
+        distance: str,
+        # Any: collection metadata is free-form JSON.
+        metadata: dict[str, Any],
+        indexes: Mapping[str, qm.PayloadSchemaType],
+    ) -> None:
         if not self.client.collection_exists(self.collection):
-            logger.info(
-                "Creating Qdrant collection %r (size=%d, distance=%s)",
-                self.collection,
-                vector_size,
-                distance,
-            )
             self.client.create_collection(
                 collection_name=self.collection,
-                vectors_config=VectorParams(
-                    size=vector_size, distance=_distance(distance)
-                ),
-            )
-        else:
-            existing = self._existing_vector_size()
-            if existing is not None and existing != vector_size:
-                raise ValueError(
-                    f"Qdrant collection '{self.collection}' has vector size "
-                    f"{existing}, but the "
-                    f"embedding model produces {vector_size}. "
-                    "Use a new QDRANT_COLLECTION name "
-                    "or delete the collection."
-                )
-        for field_name, schema in _PAYLOAD_INDEXES.items():
-            try:
-                self.client.create_payload_index(
-                    collection_name=self.collection,
-                    field_name=field_name,
-                    field_schema=schema,
-                )
-            except Exception:
-                logger.debug(
-                    "Payload index %r not created (may already exist)", field_name
-                )
-
-    def _existing_vector_size(self) -> int | None:
-        info = self.client.get_collection(self.collection)
-        vectors: Any = info.config.params.vectors
-        if hasattr(vectors, "size"):
-            return int(vectors.size)
-        if isinstance(vectors, dict) and vectors:
-            first = next(iter(vectors.values()))
-            if hasattr(first, "size"):
-                return int(first.size)
-        return None
-
-    # ------------------------------------------------------------------
-    # Reads
-    # ------------------------------------------------------------------
-
-    def get_payloads(self, ids: Sequence[str], fields: list[str]) -> dict[str, Payload]:
-        if not ids:
-            return {}
-        result: dict[str, Payload] = {}
-        for start in range(0, len(ids), 256):
-            points = self.client.retrieve(
-                collection_name=self.collection,
-                ids=list(ids[start : start + 256]),
-                with_payload=fields,
-                with_vectors=False,
-            )
-            for p in points:
-                result[str(p.id)] = p.payload or {}
-        return result
-
-    def scroll_ids(
-        self, flt: Filter, fields: list[str] | None = None
-    ) -> dict[str, Payload]:
-        """Return {point_id: payload} for every point matching ``flt``."""
-        out: dict[str, Payload] = {}
-        offset = None
-        while True:
-            points, offset = self.client.scroll(
-                collection_name=self.collection,
-                scroll_filter=flt,
-                limit=512,
-                offset=offset,
-                with_payload=fields or False,
-                with_vectors=False,
-            )
-            for p in points:
-                out[str(p.id)] = p.payload or {}
-            if offset is None:
-                break
-        return out
-
-    def item_ids_in_library(self, library_id: str) -> set[str]:
-        flt = Filter(
-            must=[
-                _match("library_id", library_id),
-                _match("chunk_type", "item_metadata"),
-            ]
-        )
-        return {
-            str(payload.get("item_id"))
-            for payload in self.scroll_ids(flt, ["item_id"]).values()
-            if payload.get("item_id")
-        }
-
-    def items_for_work(self, wid: str) -> list[tuple[str, str]]:
-        """(item_id, library_id) of every indexed audiobook of a work."""
-        flt = Filter(
-            must=[_match("work_ids", wid), _match("chunk_type", "item_metadata")]
-        )
-        return [
-            (str(p["item_id"]), str(p.get("library_id")))
-            for p in self.scroll_ids(flt, ["item_id", "library_id"]).values()
-            if p.get("item_id")
-        ]
-
-    def library_ids(self) -> set[str]:
-        flt = Filter(
-            must=[FieldCondition(key="source", match=MatchAny(any=list(SOURCES)))]
-        )
-        return {
-            str(p.get("library_id"))
-            for p in self.scroll_ids(flt, ["library_id"]).values()
-            if p.get("library_id")
-        }
-
-    # ------------------------------------------------------------------
-    # Writes
-    # ------------------------------------------------------------------
-
-    def upsert(
-        self,
-        docs: Sequence[Document],
-        vectors: Sequence[list[float]],
-        extra_payload: dict[str, Any] | None = None,
-    ) -> int:
-        if len(docs) != len(vectors):
-            raise ValueError("docs and vectors must have equal lengths")
-        if not docs:
-            return 0
-        now = datetime.now(tz=UTC).isoformat()
-        points = [
-            PointStruct(
-                id=doc.point_id,
-                vector=vector,
-                payload={
-                    **doc.payload,
-                    **(extra_payload or {}),
-                    "chunk_type": doc.chunk_type,
-                    "doc_key": doc.key,
-                    "text": doc.text,
-                    "context": doc.context,
-                    "content_hash": doc.content_hash,
-                    "ingested_at": now,
-                    "indexed_at": now,
+                vectors_config={
+                    DENSE: qm.VectorParams(size=vector_size, distance=_distance(distance))
                 },
+                sparse_vectors_config={SPARSE: qm.SparseVectorParams(modifier=qm.Modifier.IDF)},
+                metadata=metadata,
             )
-            for doc, vector in zip(docs, vectors, strict=True)
-        ]
-        for start in range(0, len(points), 256):
-            self.client.upsert(
-                collection_name=self.collection, points=points[start : start + 256]
-            )
-        return len(points)
-
-    def set_payload(self, flt: Filter, payload: dict[str, Any]) -> None:
-        self.client.set_payload(
-            collection_name=self.collection, payload=payload, points=flt
-        )
-
-    def stamp(self, item_ids: Sequence[str], payload: dict[str, Any]) -> None:
-        """Set ``payload`` on every point of the given items, 256 items per call."""
-        for start in range(0, len(item_ids), 256):
-            self.set_payload(
-                Filter(
-                    must=[
-                        FieldCondition(
-                            key="item_id",
-                            match=MatchAny(any=list(item_ids[start : start + 256])),
-                        )
-                    ]
-                ),
-                payload,
+            logger.info("Created Qdrant collection %s", self.collection)
+        else:
+            self._check_existing(vector_size, metadata)
+        for field_name, schema in indexes.items():
+            # Creating an index that exists is a no-op in Qdrant.
+            self.client.create_payload_index(
+                collection_name=self.collection, field_name=field_name, field_schema=schema
             )
 
-    def upsert_catalog(
-        self,
-        doc: Document,
-        vector: list[float],
-        extra_payload: dict[str, Any] | None = None,
-    ) -> None:
-        """Write a work point, keeping manifestations other sources merged in.
-
-        An existing point gets the new vector, text and audiobook manifestation;
-        ``formats`` is the union with whatever other sources recorded.
-        """
-        found = self.client.retrieve(
-            collection_name=self.collection,
-            ids=[doc.point_id],
-            with_payload=["formats"],
-            with_vectors=False,
-        )
-        if not found:
-            self.upsert([doc], [vector], extra_payload)
-            return
-        formats = sorted(
-            set((found[0].payload or {}).get("formats") or [])
-            | set(doc.payload.get("formats") or [])
-        )
-        now = datetime.now(tz=UTC).isoformat()
-        self.client.update_vectors(
-            collection_name=self.collection,
-            points=[PointVectors(id=doc.point_id, vector=vector)],
-        )
-        self.client.set_payload(
-            collection_name=self.collection,
-            payload={
-                # Links other services fill in (topics, asset ids, ...) are not ours
-                # to reset on a refresh.
-                **{k: v for k, v in doc.payload.items() if k not in _SHARED_LINKS},
-                **(extra_payload or {}),
-                "formats": formats,
-                "chunk_type": doc.chunk_type,
-                "doc_key": doc.key,
-                "text": doc.text,
-                "context": doc.context,
-                "content_hash": doc.content_hash,
-                "ingested_at": now,
-                "indexed_at": now,
-            },
-            points=[doc.point_id],
-        )
-
-    def remove_manifestation(self, source_id: str) -> dict[str, dict[str, Any]]:
-        """Drop an item's audiobook manifestation from its work point.
-
-        Deletes the point when no other format remains. Returns the work ids
-        touched, each with the linker values (topics, asset ids, ...) the point
-        held, so the caller can restore a surviving copy without losing them.
-        """
-        flt = Filter(must=[_match("manifestation_audiobook.source_id", source_id)])
-        found = self.scroll_ids(flt, ["work_id", *sorted(_SHARED_LINKS)])
-        for pid in found:
-            self.client.delete_payload(
-                collection_name=self.collection,
-                keys=["manifestation_audiobook"],
-                points=[pid],
+    # Any: collection metadata is free-form JSON.
+    def _check_existing(self, vector_size: int, metadata: dict[str, Any]) -> None:
+        info = self.client.get_collection(self.collection)
+        vectors = info.config.params.vectors
+        sparse = info.config.params.sparse_vectors or {}
+        if not isinstance(vectors, dict) or DENSE not in vectors or SPARSE not in sparse:
+            raise CollectionMismatchError(
+                f"Qdrant collection {self.collection!r} exists without the {DENSE!r} and "
+                f"{SPARSE!r} vectors; delete it (indexes are rebuilt from staging) or pick "
+                "another collection name"
             )
-            point = self.client.retrieve(
-                collection_name=self.collection, ids=[pid], with_payload=True
+        if vectors[DENSE].size != vector_size:
+            raise CollectionMismatchError(
+                f"Qdrant collection {self.collection!r} has {vectors[DENSE].size}-dimension "
+                f"vectors but VECTOR_SIZE is {vector_size}"
             )
-            payload = point[0].payload or {}
-            others = [k for k in payload if k.startswith("manifestation_")]
-            if others:
-                self.client.set_payload(
-                    collection_name=self.collection,
-                    payload={
-                        "formats": [
-                            f for f in payload.get("formats", []) if f != "audiobook"
-                        ]
-                    },
-                    points=[pid],
-                )
-            else:
-                self.client.delete(
-                    collection_name=self.collection,
-                    points_selector=PointIdsList(points=[pid]),
-                )
-        return {
-            str(p["work_id"]): {k: p[k] for k in _SHARED_LINKS if p.get(k)}
-            for p in found.values()
-            if p.get("work_id")
-        }
+        existing = info.config.metadata or {}
+        model = existing.get("embedding_model")
+        if model is None:
+            self.client.update_collection(collection_name=self.collection, metadata=metadata)
+        elif model != metadata.get("embedding_model"):
+            raise CollectionMismatchError(
+                f"Qdrant collection {self.collection!r} was embedded with {model!r}, not "
+                f"{metadata.get('embedding_model')!r}. Changing the model means a full "
+                "re-embed: recreate the collection, then run every source with --mode reindex"
+            )
 
-    def delete_where(self, flt: Filter) -> None:
-        self.client.delete(
-            collection_name=self.collection, points_selector=FilterSelector(filter=flt)
-        )
+    def upsert(self, points: list[qm.PointStruct]) -> None:
+        if points:
+            self.client.upsert(collection_name=self.collection, points=points)
 
-    def delete_stale(self, scope: Filter, keep_ids: set[str]) -> int:
-        """Delete points inside ``scope`` whose id is not in ``keep_ids``."""
-        existing = set(self.scroll_ids(scope).keys())
-        stale = existing - keep_ids
-        if not stale:
-            return 0
-        ids: list[ExtendedPointId] = sorted(stale)
+    def existing_hashes(self, point_ids: Iterable[str]) -> dict[str, str | None]:
+        """point id -> payload content_hash, for the points that exist."""
+        ids = list(point_ids)
+        found: dict[str, str | None] = {}
         for start in range(0, len(ids), 256):
+            records = self.client.retrieve(
+                collection_name=self.collection,
+                ids=ids[start : start + 256],
+                with_payload=["content_hash"],
+            )
+            for record in records:
+                found[str(record.id)] = (record.payload or {}).get("content_hash")
+        return found
+
+    def existing_state(self, point_ids: Iterable[str]) -> dict[str, tuple[str | None, str | None]]:
+        """point id -> (content_hash, payload_hash), for the points that exist."""
+        ids = list(point_ids)
+        found: dict[str, tuple[str | None, str | None]] = {}
+        for start in range(0, len(ids), 256):
+            records = self.client.retrieve(
+                collection_name=self.collection,
+                ids=ids[start : start + 256],
+                with_payload=["content_hash", "payload_hash"],
+            )
+            for record in records:
+                payload = record.payload or {}
+                found[str(record.id)] = (payload.get("content_hash"), payload.get("payload_hash"))
+        return found
+
+    # Any: payload values are JSON.
+    def replace_payloads(self, items: list[tuple[str, dict[str, Any]]]) -> None:
+        """Rewrite each point's payload without touching its vectors."""
+        for start in range(0, len(items), 256):
+            self.client.batch_update_points(
+                collection_name=self.collection,
+                update_operations=[
+                    qm.OverwritePayloadOperation(
+                        overwrite_payload=qm.SetPayload(payload=payload, points=[pid])
+                    )
+                    for pid, payload in items[start : start + 256]
+                ],
+            )
+
+    # Any: payload values are JSON.
+    def set_payload(self, point_ids: list[str], payload: dict[str, Any]) -> None:
+        if point_ids:
+            self.client.set_payload(
+                collection_name=self.collection,
+                payload=payload,
+                points=qm.PointIdsList(points=list(point_ids)),
+            )
+
+    # Any: payload values are JSON.
+    def set_payload_for_doc(self, source: str, doc_id: str, payload: dict[str, Any]) -> None:
+        self.client.set_payload(
+            collection_name=self.collection,
+            payload=payload,
+            points=qm.Filter(must=[_match("source", source), _match("doc_id", doc_id)]),
+        )
+
+    def delete_ids(self, point_ids: list[str]) -> None:
+        if point_ids:
             self.client.delete(
                 collection_name=self.collection,
-                points_selector=PointIdsList(points=ids[start : start + 256]),
+                points_selector=qm.PointIdsList(points=list(point_ids)),
+            )
+
+    def delete_docs(self, source: str, doc_ids: list[str]) -> None:
+        if doc_ids:
+            self.client.delete(
+                collection_name=self.collection,
+                points_selector=qm.FilterSelector(
+                    filter=qm.Filter(
+                        must=[
+                            _match("source", source),
+                            qm.FieldCondition(key="doc_id", match=qm.MatchAny(any=doc_ids)),
+                        ]
+                    )
+                ),
+            )
+
+    def delete_item_points(self, source: str, item_ids: list[str], keep: set[str]) -> int:
+        """Delete points of these items (payload ``item_id``) whose id isn't in ``keep``."""
+        if not item_ids:
+            return 0
+        selector = qm.Filter(
+            must=[
+                _match("source", source),
+                qm.FieldCondition(key="item_id", match=qm.MatchAny(any=item_ids)),
+            ]
+        )
+        stale: list[qm.ExtendedPointId] = []
+        offset: Any = None  # Any: Qdrant's opaque scroll offset
+        while True:
+            records, offset = self.client.scroll(
+                collection_name=self.collection,
+                scroll_filter=selector,
+                limit=512,
+                offset=offset,
+                with_payload=False,
+            )
+            stale.extend(r.id for r in records if str(r.id) not in keep)
+            if offset is None:
+                break
+        if stale:
+            self.client.delete(
+                collection_name=self.collection,
+                points_selector=qm.PointIdsList(points=stale),
             )
         return len(stale)
 
-    def delete_items(self, item_ids: Sequence[str]) -> None:
-        if not item_ids:
-            return
-        self.delete_where(
-            Filter(
-                must=[FieldCondition(key="item_id", match=MatchAny(any=list(item_ids)))]
+    def delete_stale(self, source: str, run_id: str) -> int:
+        """Delete this source's points not stamped with ``run_id``."""
+        stale = qm.Filter(must=[_match("source", source)], must_not=[_match("sync_run_id", run_id)])
+        count = self.client.count(collection_name=self.collection, count_filter=stale).count
+        if count:
+            self.client.delete(
+                collection_name=self.collection, points_selector=qm.FilterSelector(filter=stale)
             )
-        )
+        return count
 
-    def delete_library(self, library_id: str) -> None:
-        self.delete_where(Filter(must=[_match("library_id", library_id)]))
+    def count(self, source: str | None = None) -> int:
+        selector = qm.Filter(must=[_match("source", source)]) if source else None
+        return self.client.count(collection_name=self.collection, count_filter=selector).count
 
-    def search(
-        self,
-        vector: list[float],
-        *,
-        limit: int = 5,
-        chunk_type: str | None = None,
-        library_id: str | None = None,
-        min_score: float | None = None,
-    ) -> list[tuple[float, Payload]]:
-        must: list[Condition] = []
-        if chunk_type:
-            must.append(_match("chunk_type", chunk_type))
-        if library_id:
-            must.append(_match("library_id", library_id))
-        hits = self.client.query_points(
-            collection_name=self.collection,
-            query=vector,
-            query_filter=Filter(must=must) if must else None,
-            limit=limit,
-            with_payload=True,
-            score_threshold=min_score,
-        ).points
-        return [(hit.score, hit.payload or {}) for hit in hits]
-
-    def count(self) -> int:
-        return self.client.count(collection_name=self.collection, exact=True).count
-
-
-def item_scope(item_id: str) -> Filter:
-    return Filter(must=[_match("item_id", item_id)])
-
-
-def item_chunk_scope(item_id: str, chunk_type: str) -> Filter:
-    return Filter(must=[_match("item_id", item_id), _match("chunk_type", chunk_type)])
-
-
-def library_chunk_scope(library_id: str, chunk_type: str) -> Filter:
-    return Filter(
-        must=[_match("library_id", library_id), _match("chunk_type", chunk_type)]
-    )
+    # Any: payloads are JSON.
+    def payloads(self, source: str | None = None) -> list[dict[str, Any]]:
+        """Every payload in the collection (or one source's); for tests and checks."""
+        selector = qm.Filter(must=[_match("source", source)]) if source else None
+        out: list[dict[str, Any]] = []
+        offset: Any = None  # Any: Qdrant's opaque scroll offset
+        while True:
+            records, offset = self.client.scroll(
+                collection_name=self.collection,
+                scroll_filter=selector,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+            )
+            out.extend(r.payload or {} for r in records)
+            if offset is None:
+                return out

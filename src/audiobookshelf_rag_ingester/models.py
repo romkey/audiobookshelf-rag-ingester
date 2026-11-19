@@ -1,11 +1,15 @@
 """Normalized views of Audiobookshelf JSON.
 
-The ABS API returns slightly different shapes for minified (list) and
-expanded (detail) items, and for books vs. podcasts. Everything downstream
-works with these dataclasses instead of raw dicts.
+The ABS API returns different shapes for minified (list) and expanded
+(detail) items, and for books and podcasts; field names follow the server's
+``server/models/LibraryItem.js``, ``Book.js``, ``Podcast.js`` and
+``PodcastEpisode.js``. Only catalog fields are read: listening progress,
+sessions, bookmarks and users are never part of an item.
 """
 
-from dataclasses import dataclass, field
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
 from typing import Any  # Any: decoded JSON from the Audiobookshelf API
 
 
@@ -21,8 +25,11 @@ class SeriesRef:
     name: str
     sequence: str | None = None
 
-    def label(self) -> str:
-        return f"{self.name} #{self.sequence}" if self.sequence else self.name
+    def index(self) -> float | None:
+        try:
+            return float(self.sequence) if self.sequence else None
+        except ValueError:
+            return None
 
 
 @dataclass(frozen=True)
@@ -33,15 +40,10 @@ class Chapter:
 
 
 @dataclass(frozen=True)
-class EbookFile:
-    filename: str | None
-    format: str | None
+class AudioFile:
+    ext: str | None
     size: int | None
-    ino: str | None
-    mtime_ms: int | None
-
-    def signature(self) -> str:
-        return f"{self.ino}:{self.size}:{self.mtime_ms}"
+    duration: float | None
 
 
 @dataclass(frozen=True)
@@ -56,7 +58,17 @@ class Episode:
     pub_date: str | None
     published_at: int | None
     duration: float | None
-    chapters: list[Chapter] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ListedItem:
+    """A minified item from a library listing: enough to tell what changed."""
+
+    id: str
+    library_id: str
+    media_type: str
+    title: str
+    updated_at: int | None
 
 
 @dataclass(frozen=True)
@@ -67,7 +79,6 @@ class LibraryItem:
     title: str
     subtitle: str | None
     authors: list[str]
-    author_ids: dict[str, str]  # name -> ABS author id (expanded items only)
     narrators: list[str]
     series: list[SeriesRef]
     genres: list[str]
@@ -82,49 +93,19 @@ class LibraryItem:
     explicit: bool
     abridged: bool
     duration: float | None
-    size: int | None
-    num_chapters: int
-    num_episodes: int
+    cover_path: str | None
     added_at: int | None
     updated_at: int | None
-    mtime_ms: int | None
-    is_missing: bool
-    is_invalid: bool
-    rel_path: str | None
-    # Podcast-only metadata
-    feed_url: str | None = None
-    itunes_page_url: str | None = None
-    podcast_type: str | None = None
-    release_date: str | None = None
-    # Expanded-only data
     chapters: list[Chapter] = field(default_factory=list)
+    audio_files: list[AudioFile] = field(default_factory=list)
+    has_ebook: bool = False
+    # Podcast-only
+    podcast_type: str | None = None
     episodes: list[Episode] = field(default_factory=list)
-    ebook: EbookFile | None = None
-    ebook_format: str | None = None
 
-    def fingerprint(self) -> str:
-        """Cheap change detector built from fields present on minified list items."""
-        return ":".join(
-            str(v)
-            for v in (
-                self.updated_at,
-                self.mtime_ms,
-                self.size,
-                self.num_episodes,
-                self.num_chapters,
-                self.ebook_format,
-            )
-        )
-
-
-@dataclass(frozen=True)
-class Author:
-    id: str
-    name: str
-    description: str | None
-    asin: str | None
-    num_books: int | None
-    updated_at: int | None
+    # Any: a JSON-ready dict of the record.
+    def to_json(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def _str_or_none(value: Any) -> str | None:
@@ -168,6 +149,18 @@ def parse_library(data: dict[str, Any]) -> Library:
     )
 
 
+def parse_listed(data: dict[str, Any]) -> ListedItem:
+    media = data.get("media") or {}
+    metadata = media.get("metadata") or {}
+    return ListedItem(
+        id=str(data["id"]),
+        library_id=str(data.get("libraryId") or ""),
+        media_type=str(data.get("mediaType") or "book"),
+        title=_str_or_none(metadata.get("title")) or "Untitled",
+        updated_at=_int_or_none(data.get("updatedAt")),
+    )
+
+
 def parse_chapters(raw: Any) -> list[Chapter]:
     chapters: list[Chapter] = []
     if not isinstance(raw, list):
@@ -188,35 +181,37 @@ def parse_chapters(raw: Any) -> list[Chapter]:
 def _parse_series(metadata: dict[str, Any]) -> list[SeriesRef]:
     raw = metadata.get("series")
     if isinstance(raw, list) and raw:
-        refs = []
-        for s in raw:
-            if isinstance(s, dict) and s.get("name"):
-                refs.append(SeriesRef(str(s["name"]), _str_or_none(s.get("sequence"))))
-        return refs
+        return [
+            SeriesRef(str(s["name"]), _str_or_none(s.get("sequence")))
+            for s in raw
+            if isinstance(s, dict) and s.get("name")
+        ]
     if isinstance(raw, dict) and raw.get("name"):
         return [SeriesRef(str(raw["name"]), _str_or_none(raw.get("sequence")))]
     # Minified items only carry "Series Name #1, Other Series #2"
     refs = []
     for part in _split_names(metadata.get("seriesName")):
         name, sep, seq = part.rpartition(" #")
-        if sep and name:
-            refs.append(SeriesRef(name.strip(), seq.strip() or None))
-        else:
-            refs.append(SeriesRef(part))
+        refs.append(
+            SeriesRef(name.strip(), seq.strip() or None) if sep and name else SeriesRef(part)
+        )
     return refs
 
 
-def _parse_ebook(raw: Any) -> EbookFile | None:
-    if not isinstance(raw, dict):
-        return None
-    meta = raw.get("metadata") or {}
-    return EbookFile(
-        filename=_str_or_none(meta.get("filename")),
-        format=_str_or_none(raw.get("ebookFormat") or meta.get("ext", "").lstrip(".")),
-        size=_int_or_none(meta.get("size")),
-        ino=_str_or_none(raw.get("ino")),
-        mtime_ms=_int_or_none(meta.get("mtimeMs")),
-    )
+def _parse_audio_files(raw: Any) -> list[AudioFile]:
+    files: list[AudioFile] = []
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        meta = entry.get("metadata") or {}
+        files.append(
+            AudioFile(
+                ext=_str_or_none(str(meta.get("ext") or "").lstrip(".").upper()),
+                size=_int_or_none(meta.get("size")),
+                duration=_float_or_none(entry.get("duration")),
+            )
+        )
+    return files
 
 
 def _parse_episode(raw: dict[str, Any]) -> Episode:
@@ -235,42 +230,25 @@ def _parse_episode(raw: dict[str, Any]) -> Episode:
         pub_date=_str_or_none(raw.get("pubDate")),
         published_at=_int_or_none(raw.get("publishedAt")),
         duration=duration,
-        chapters=parse_chapters(raw.get("chapters")),
     )
 
 
 def parse_item(data: dict[str, Any]) -> LibraryItem:
-    """Parse a minified or expanded ABS library item."""
+    """Parse an expanded ABS library item (``GET /api/items/:id?expanded=1``)."""
     media = data.get("media") or {}
     metadata = media.get("metadata") or {}
     media_type = str(data.get("mediaType") or "book")
 
     raw_authors = metadata.get("authors")
-    author_ids: dict[str, str] = {}
     if isinstance(raw_authors, list) and raw_authors:
-        authors = []
-        for a in raw_authors:
-            if isinstance(a, dict) and a.get("name"):
-                authors.append(str(a["name"]))
-                if a.get("id"):
-                    author_ids[str(a["name"])] = str(a["id"])
+        authors = [str(a["name"]) for a in raw_authors if isinstance(a, dict) and a.get("name")]
     elif media_type == "podcast":
-        authors = [metadata["author"]] if metadata.get("author") else []
+        authors = [str(metadata["author"])] if metadata.get("author") else []
     else:
         authors = _split_names(metadata.get("authorName"))
 
-    narrators = _str_list(metadata.get("narrators")) or _split_names(
-        metadata.get("narratorName")
-    )
-
-    chapters = parse_chapters(media.get("chapters"))
-    episodes = [
-        _parse_episode(e) for e in (media.get("episodes") or []) if isinstance(e, dict)
-    ]
-    ebook = _parse_ebook(media.get("ebookFile"))
-
-    num_chapters = _int_or_none(media.get("numChapters"))
-    num_episodes = _int_or_none(media.get("numEpisodes"))
+    narrators = _str_list(metadata.get("narrators")) or _split_names(metadata.get("narratorName"))
+    episodes = [_parse_episode(e) for e in (media.get("episodes") or []) if isinstance(e, dict)]
 
     return LibraryItem(
         id=str(data["id"]),
@@ -279,7 +257,6 @@ def parse_item(data: dict[str, Any]) -> LibraryItem:
         title=_str_or_none(metadata.get("title")) or "Untitled",
         subtitle=_str_or_none(metadata.get("subtitle")),
         authors=authors,
-        author_ids=author_ids,
         narrators=narrators,
         series=_parse_series(metadata) if media_type == "book" else [],
         genres=_str_list(metadata.get("genres")),
@@ -294,33 +271,12 @@ def parse_item(data: dict[str, Any]) -> LibraryItem:
         explicit=bool(metadata.get("explicit")),
         abridged=bool(metadata.get("abridged")),
         duration=_float_or_none(media.get("duration")),
-        size=_int_or_none(data.get("size") or media.get("size")),
-        num_chapters=num_chapters if num_chapters is not None else len(chapters),
-        num_episodes=num_episodes if num_episodes is not None else len(episodes),
+        cover_path=_str_or_none(media.get("coverPath")),
         added_at=_int_or_none(data.get("addedAt")),
         updated_at=_int_or_none(data.get("updatedAt")),
-        mtime_ms=_int_or_none(data.get("mtimeMs")),
-        is_missing=bool(data.get("isMissing")),
-        is_invalid=bool(data.get("isInvalid")),
-        rel_path=_str_or_none(data.get("relPath")),
-        feed_url=_str_or_none(metadata.get("feedUrl")),
-        itunes_page_url=_str_or_none(metadata.get("itunesPageUrl")),
+        chapters=parse_chapters(media.get("chapters")),
+        audio_files=_parse_audio_files(media.get("audioFiles")),
+        has_ebook=bool(media.get("ebookFile")),
         podcast_type=_str_or_none(metadata.get("type")),
-        release_date=_str_or_none(metadata.get("releaseDate")),
-        chapters=chapters,
         episodes=episodes,
-        ebook=ebook,
-        ebook_format=_str_or_none(media.get("ebookFormat"))
-        or (ebook.format if ebook else None),
-    )
-
-
-def parse_author(data: dict[str, Any]) -> Author:
-    return Author(
-        id=str(data["id"]),
-        name=str(data.get("name") or "Unknown"),
-        description=_str_or_none(data.get("description")),
-        asin=_str_or_none(data.get("asin")),
-        num_books=_int_or_none(data.get("numBooks")),
-        updated_at=_int_or_none(data.get("updatedAt")),
     )

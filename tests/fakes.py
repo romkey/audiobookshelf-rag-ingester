@@ -2,12 +2,10 @@
 
 import copy
 import hashlib
-import io
 from collections.abc import Callable
-from dataclasses import replace
 from typing import Any
 
-from audiobookshelf_rag_ingester.config import Settings
+from audiobookshelf_rag_ingester.embeddings import EmbedKind
 
 # Any: these build and return ABS API JSON, which is free-form.
 type JSON = dict[str, Any]
@@ -19,14 +17,23 @@ PODCAST_LIBRARY: JSON = {"id": "lib-pods", "name": "Podcasts", "mediaType": "pod
 def expanded_book(
     item_id: str = "li-1",
     *,
-    title: str = "The Long Way",
+    title: str = "The Long Way to a Small, Angry Planet",
     updated_at: int = 1_700_000_000_000,
     description: str = "<p>A crew of misfits tunnels through space.</p>",
+    authors: tuple[str, ...] = ("Becky Chambers",),
+    narrators: tuple[str, ...] = ("Rachel Dulude",),
+    series: str | None = "Wayfarers",
+    sequence: str | None = "1",
+    isbn: str | None = None,
+    asin: str | None = "B01M0N8Q5I",
+    genres: tuple[str, ...] = ("Science Fiction",),
+    duration: float = 3600 * 15.5,
+    library_id: str = "lib-books",
     ebook: bool = False,
 ) -> JSON:
     return {
         "id": item_id,
-        "libraryId": "lib-books",
+        "libraryId": library_id,
         "mediaType": "book",
         "addedAt": 1_690_000_000_000,
         "updatedAt": updated_at,
@@ -38,45 +45,40 @@ def expanded_book(
         "media": {
             "metadata": {
                 "title": title,
-                "subtitle": "Wayfarers 1",
-                "authors": [{"id": "au-1", "name": "Becky Chambers"}],
-                "narrators": ["Patricia Rodriguez"],
-                "series": [{"id": "se-1", "name": "Wayfarers", "sequence": "1"}],
-                "genres": ["Science Fiction"],
+                "subtitle": None,
+                "authors": [{"id": f"au-{n}", "name": a} for n, a in enumerate(authors)],
+                "narrators": list(narrators),
+                "series": (
+                    [{"id": "se-1", "name": series, "sequence": sequence}] if series else []
+                ),
+                "genres": list(genres),
                 "publishedYear": "2014",
                 "publisher": "Harper Voyager",
                 "description": description,
-                "isbn": "9780062444134",
-                "asin": "B01M0N8Q5I",
+                "isbn": isbn,
+                "asin": asin,
                 "language": "English",
                 "explicit": False,
                 "abridged": False,
-                "authorName": "Becky Chambers",
-                "narratorName": "Patricia Rodriguez",
-                "seriesName": "Wayfarers #1",
+                "authorName": ", ".join(authors),
+                "narratorName": ", ".join(narrators),
+                "seriesName": f"{series} #{sequence}" if series else "",
             },
+            "coverPath": f"/audiobooks/{item_id}/cover.jpg",
             "tags": ["favorites"],
-            "duration": 3600 * 15.5,
+            "duration": duration,
             "numChapters": 3,
             "chapters": [
                 {"id": 0, "start": 0, "end": 1200, "title": "Opening Credits"},
                 {"id": 1, "start": 1200, "end": 4000, "title": "Transit"},
                 {"id": 2, "start": 4000, "end": 55800, "title": "The Long Way"},
             ],
-            "ebookFile": (
-                {
-                    "ino": "999",
-                    "ebookFormat": "epub",
-                    "metadata": {
-                        "filename": "book.epub",
-                        "ext": ".epub",
-                        "size": 1000,
-                        "mtimeMs": 1_690_000_000_000,
-                    },
-                }
-                if ebook
-                else None
+            "audioFiles": (
+                [{"index": 1, "duration": duration, "metadata": {"ext": ".m4b", "size": 9000}}]
+                if duration
+                else []
             ),
+            "ebookFile": {"ino": "9", "ebookFormat": "epub", "metadata": {}} if ebook else None,
         },
     }
 
@@ -91,6 +93,7 @@ def minified(expanded: JSON) -> JSON:
         meta.pop("narrators", None)
         meta.pop("series", None)
         media.pop("chapters", None)
+        media["numAudioFiles"] = len(media.pop("audioFiles", []))
         ebook = media.pop("ebookFile", None)
         media["ebookFormat"] = ebook["ebookFormat"] if ebook else None
     else:
@@ -146,19 +149,9 @@ class FakeAbsClient:
     def __init__(self) -> None:
         self.libraries: list[JSON] = [BOOK_LIBRARY]
         self.items: dict[str, JSON] = {}
-        self.authors: dict[str, list[JSON]] = {
-            "lib-books": [
-                {
-                    "id": "au-1",
-                    "name": "Becky Chambers",
-                    "description": "Becky Chambers writes hopeful science fiction.",
-                    "numBooks": 1,
-                }
-            ]
-        }
-        self.ebook_bytes: bytes | None = None
         self.calls: list[str] = []
         self.fail_items: set[str] = set()
+        self.fail_libraries: set[str] = set()
         self.on_item: Callable[[str], None] | None = None
 
     def add(self, expanded: JSON) -> None:
@@ -170,11 +163,9 @@ class FakeAbsClient:
 
     def list_library_items(self, library_id: str) -> list[JSON]:
         self.calls.append(f"items:{library_id}")
-        return [
-            minified(item)
-            for item in self.items.values()
-            if item["libraryId"] == library_id
-        ]
+        if library_id in self.fail_libraries:
+            raise RuntimeError("listing failed")
+        return [minified(item) for item in self.items.values() if item["libraryId"] == library_id]
 
     def get_item(self, item_id: str) -> JSON:
         self.calls.append(f"item:{item_id}")
@@ -184,67 +175,21 @@ class FakeAbsClient:
             raise RuntimeError("boom")
         return copy.deepcopy(self.items[item_id])
 
-    def list_authors(self, library_id: str) -> list[JSON]:
-        return list(self.authors.get(library_id, []))
-
-    def download_ebook(self, item_id: str, max_bytes: int) -> bytes | None:
-        self.calls.append(f"ebook:{item_id}")
-        return self.ebook_bytes
-
 
 class FakeEmbedder:
-    """Deterministic 8-dim vectors derived from a hash of the text."""
-
-    dimension = 8
+    """Deterministic 8-dimension vectors from a hash of the text."""
 
     def __init__(self) -> None:
-        self.texts: list[str] = []
-        self.kinds: list[str] = []
+        self.calls: list[list[str]] = []
 
-    def encode(self, texts: list[str], kind: str = "document") -> list[list[float]]:
-        self.kinds.append(kind)
-        self.texts.extend(texts)
+    def encode(self, chunks: list[str], kind: EmbedKind = "document") -> list[list[float]]:
+        self.calls.append(list(chunks))
         out = []
-        for t in texts:
+        for t in chunks:
             digest = hashlib.sha256(t.encode()).digest()
             out.append([b / 255 + 0.01 for b in digest[:8]])
         return out
 
-
-BASE_SETTINGS = Settings(
-    abs_url="http://abs.local",
-    abs_api_token="test-token",  # noqa: S106 - dummy test token; not-a-secret
-    abs_public_url="https://abs.example.com",
-    chunk_size=400,
-    chunk_overlap=40,
-    poll_interval_seconds=0,
-    qdrant_catalog_collection="",
-    ingest_ebooks=True,
-)
-
-
-# Any: test overrides for any Settings field.
-def make_settings(**overrides: Any) -> Settings:
-    return replace(BASE_SETTINGS, **overrides)
-
-
-def build_epub_bytes(chapters: list[tuple[str, str]]) -> bytes:
-    from ebooklib import epub
-
-    book = epub.EpubBook()
-    book.set_identifier("id123")
-    book.set_title("Test Book")
-    book.set_language("en")
-    items = []
-    for idx, (title, body) in enumerate(chapters):
-        ch = epub.EpubHtml(title=title, file_name=f"ch{idx}.xhtml", lang="en")
-        ch.content = f"<html><body><h1>{title}</h1><p>{body}</p></body></html>"
-        book.add_item(ch)
-        items.append(ch)
-    book.toc = items
-    book.add_item(epub.EpubNcx())
-    book.add_item(epub.EpubNav())
-    book.spine = ["nav", *items]
-    buf = io.BytesIO()
-    epub.write_epub(buf, book)
-    return buf.getvalue()
+    @property
+    def texts(self) -> list[str]:
+        return [t for call in self.calls for t in call]

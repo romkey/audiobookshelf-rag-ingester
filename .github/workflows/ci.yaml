@@ -47,6 +47,21 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Tests run against a real PostgreSQL.
+    services:
+      db:
+        image: postgres:18-trixie
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app  # not-a-secret: CI only
+          POSTGRES_DB: app
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d app"
+          --health-interval 2s --health-timeout 5s --health-retries 15
+    env:
+      DATABASE_URL: postgresql://app:app@localhost:5432/app  # not-a-secret
     steps:
       - uses: actions/checkout@v7
       # uv installs the Python in .python-version and the locked

@@ -1,7 +1,7 @@
 # Tests, as CI runs them: pytest with coverage against your working tree.
 #
 #   docker compose -f docker-compose.test.yaml run --rm test
-#   docker compose -f docker-compose.test.yaml run --rm test pytest -k healthz
+#   docker compose -f docker-compose.test.yaml run --rm test pytest -k pipeline
 #
 # The working tree is mounted, so code changes need no rebuild; dependency
 # changes are synced from uv.lock on each run.
@@ -13,9 +13,29 @@ services:
       target: dev
     entrypoint: ["uv", "run", "--locked"]
     command: ["pytest"]
+    environment:
+      DATABASE_URL: postgresql://app:app@db:5432/app  # not-a-secret: tests only
     volumes:
       - .:/app
       - uv-cache:/root/.cache/uv
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Tests run against a real PostgreSQL; tmpfs makes every run start empty.
+  db:
+    image: postgres:18-trixie
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app  # not-a-secret: tests only
+      POSTGRES_DB: app
+    tmpfs:
+      - /var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
 
 volumes:
   uv-cache:

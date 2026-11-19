@@ -1,12 +1,25 @@
-# Production: runs the released image from ghcr.io, plus Qdrant. Configure
-# it in .env next to this file (see .env.example and docs/configuration.md).
+# Production: runs the released image from ghcr.io. Configure it in .env
+# next to this file (see .env.example and docs/configuration.md).
 #
-#   docker compose -f docker-compose.prod.yaml up -d
-#   APP_VERSION=1.2.3 docker compose -f docker-compose.prod.yaml up -d   # pin a release
-#   docker compose -f docker-compose.prod.yaml build   # build the image locally instead
+#   docker compose -f docker-compose.prod.yaml run --rm app      # one full sync
+#   APP_VERSION=1.2.3 docker compose -f docker-compose.prod.yaml run --rm app   # pin a release
+#   docker compose -f docker-compose.prod.yaml build              # build the image locally
 #
-# Already running Qdrant elsewhere? Delete the qdrant service and depends_on,
-# and set QDRANT_URL in .env.
+# The ingester is a batch job: each run syncs and exits, so it has no port,
+# no health check and doesn't restart. Schedule it from cron:
+#
+#   # hourly: changed and deleted items; nightly: full reconcile
+#   C="docker compose -f /srv/abs-rag/docker-compose.prod.yaml run --rm app"
+#   10 * * * * $C audiobookshelf-rag-ingester run --mode incremental
+#   40 3 * * * $C audiobookshelf-rag-ingester run --mode full
+#
+# Each run applies any pending database migrations before it syncs.
+# Overlapping runs are safe: a second run finds the lock held and exits.
+#
+# PostgreSQL and Qdrant are shared with the pipeline's other ingesters (the
+# ebook source writes the same works, catalog table and collections). If they
+# already run elsewhere, delete the db and qdrant services and depends_on,
+# and set DATABASE_URL and QDRANT_URL in .env.
 
 services:
   app:
@@ -14,7 +27,10 @@ services:
     build:
       context: .
       target: production
-    restart: unless-stopped
+    command: ["audiobookshelf-rag-ingester", "run", "--mode", "full"]
+    restart: "no"
+    # On SIGTERM it finishes the item it is reading and indexes what is staged.
+    stop_grace_period: 5m
     env_file:
       - path: .env
         required: false
@@ -23,15 +39,10 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - qdrant
-    # The app is a worker with no port: it touches a heartbeat file while it
-    # works and sleeps, and this fails if the file goes stale.
-    healthcheck:
-      test: ["CMD", "audiobookshelf-rag-ingester", "healthcheck"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+      qdrant:
+        condition: service_healthy
+      db:
+        condition: service_healthy
     # Least privilege: nothing to write but /tmp, no capabilities.
     read_only: true
     tmpfs:
@@ -48,6 +59,32 @@ services:
       - "127.0.0.1:6333:6333"
     volumes:
       - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+
+  # No ports: only the ingesters on this network reach it. Back up db-data.
+  db:
+    image: postgres:18-trixie
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - db-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   qdrant-data:
+  db-data:
