@@ -6,9 +6,7 @@ import pytest
 from audiobookshelf_rag_ingester.abs_client import AbsClient, AbsClientError
 
 
-def _client(
-    handler: Callable[[httpx.Request], httpx.Response], page_size: int = 2
-) -> AbsClient:
+def _client(handler: Callable[[httpx.Request], httpx.Response], page_size: int = 2) -> AbsClient:
     return AbsClient(
         base_url="http://abs.local/",
         token="secret",  # noqa: S106 - dummy test token
@@ -51,13 +49,6 @@ def test_get_item_expanded() -> None:
     assert _client(handler).get_item("abc") == {"id": "abc"}
 
 
-def test_authors_both_shapes() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"authors": [{"id": "a"}]})
-
-    assert _client(handler).list_authors("l1") == [{"id": "a"}]
-
-
 def test_unauthorized_raises() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401)
@@ -72,25 +63,6 @@ def test_server_error_raises_after_retries() -> None:
 
     with pytest.raises(AbsClientError):
         _client(handler).list_libraries()
-
-
-def test_download_ebook_respects_size_limit() -> None:
-    payload = b"x" * 5000
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/items/i1/ebook"
-        return httpx.Response(200, content=payload)
-
-    client = _client(handler)
-    assert client.download_ebook("i1", max_bytes=10_000) == payload
-    assert client.download_ebook("i1", max_bytes=100) is None
-
-
-def test_download_ebook_missing() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404)
-
-    assert _client(handler).download_ebook("i1", max_bytes=100) is None
 
 
 def test_retries_then_succeeds() -> None:

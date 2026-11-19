@@ -38,9 +38,7 @@ def variables_read(source: str) -> set[str]:
     for node in ast.walk(ast.parse(source)):
         name = None
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if (
-                node.func.attr == "get" and is_env(node.func.value)
-            ) or node.func.attr == "getenv":
+            if (node.func.attr == "get" and is_env(node.func.value)) or node.func.attr == "getenv":
                 name = first_name(node.args)
         elif isinstance(node, ast.Subscript) and is_env(node.value):
             name = first_name([node.slice])

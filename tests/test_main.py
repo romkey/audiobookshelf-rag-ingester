@@ -1,27 +1,51 @@
-import io
+from __future__ import annotations
+
+import json
 import signal
+import threading
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
-import httpx
 import pytest
-from qdrant_client.http.exceptions import ResponseHandlingException
 
 from audiobookshelf_rag_ingester import __main__ as cli
-from audiobookshelf_rag_ingester import __version__, heartbeat
-from audiobookshelf_rag_ingester.qdrant_store import QdrantStore
-from audiobookshelf_rag_ingester.query import Hit, format_hits, search
-from audiobookshelf_rag_ingester.service import CycleStats, IngestionService
-from tests.fakes import FakeEmbedder, make_settings
+from audiobookshelf_rag_ingester import __version__, pipeline
+from audiobookshelf_rag_ingester.config import Settings
+from audiobookshelf_rag_ingester.db import RunCounts
+from audiobookshelf_rag_ingester.pipeline import RunResult
 
-ENV = {"ABS_URL": "http://abs.local", "ABS_API_TOKEN": "tok"}
+SettingsFactory = Callable[..., Settings]  # the make_settings fixture
 
 
-@pytest.fixture
-def env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name, value in ENV.items():
-        monkeypatch.setenv(name, value)
+@pytest.fixture(autouse=True)
+def _no_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Never read a developer's real .env during tests.
+    monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def migrations(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    # Records the database URLs main() migrated instead of touching Postgres.
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "migrate", calls.append)
+    return calls
+
+
+def _use_settings(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> None:
+    monkeypatch.setattr(Settings, "from_env", classmethod(lambda cls: settings))
+
+
+def _fake_run(
+    monkeypatch: pytest.MonkeyPatch, result: RunResult | Exception, seen: list[Any] | None = None
+) -> None:
+    def run(settings: Settings, mode: str, stop: threading.Event) -> RunResult:
+        if seen is not None:
+            seen.append((mode, stop))
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(pipeline, "run", run)
 
 
 def test_version(capsys: pytest.CaptureFixture[str]) -> None:
@@ -34,188 +58,129 @@ def test_version(capsys: pytest.CaptureFixture[str]) -> None:
 def test_bad_config_exits_2(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.delenv("ABS_URL", raising=False)
+    for name in ("ABS_URL", "ABS_API_TOKEN", "DATABASE_URL"):
+        monkeypatch.delenv(name, raising=False)
     with pytest.raises(SystemExit) as exit_info:
         cli.main([])
     assert exit_info.value.code == 2
-    assert "ABS_URL is required" in capsys.readouterr().err
+    assert "ABS_URL" in capsys.readouterr().err
 
 
-def test_healthcheck(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    beat = tmp_path / "beat"
-    monkeypatch.setattr(heartbeat, "DEFAULT_PATH", beat)
-    assert cli.main(["healthcheck"]) == 1
-    heartbeat.touch(beat)
-    assert cli.main(["healthcheck"]) == 0
-
-
-def _fake_run_sync(result: int | BaseException) -> Callable[..., int]:
-    # Any: stands in for run_sync's keyword arguments.
-    def run(settings: Any, *, once: bool) -> int:
-        if isinstance(result, BaseException):
-            raise result
-        return result
-
-    return run
-
-
-@pytest.mark.usefixtures("env")
-@pytest.mark.parametrize(
-    ("result", "code"),
-    [
-        (0, 0),
-        (2, 2),
-        (KeyboardInterrupt(), 130),
-        (httpx.ConnectError("refused"), 1),
-        (ValueError("vector size"), 1),
-    ],
-)
-def test_main_exit_codes(
-    monkeypatch: pytest.MonkeyPatch, result: int | BaseException, code: int
-) -> None:
-    monkeypatch.setattr(cli, "run_sync", _fake_run_sync(result))
-    assert cli.main(["--once"]) == code
-
-
-@pytest.mark.usefixtures("env")
-def test_main_query(monkeypatch: pytest.MonkeyPatch) -> None:
-    seen: dict[str, Any] = {}
-
-    def fake_query(settings: Any, args: Any) -> int:
-        seen["text"] = args.text
-        seen["type"] = args.type
-        return 0
-
-    monkeypatch.setattr(cli, "run_query", fake_query)
-    assert cli.main(["query", "--type", "episode", "laser cutters"]) == 0
-    assert seen == {"text": "laser cutters", "type": "episode"}
-
-
-class FakeService:
-    """Records how run_sync drives the service."""
-
-    def __init__(self, errors: int = 0) -> None:
-        self.errors = errors
-        self.ran: list[str] = []
-        self.stopped = False
-
-    def run_cycle(self) -> CycleStats:
-        self.ran.append("cycle")
-        return CycleStats(errors=self.errors)
-
-    def run_forever(self) -> None:
-        self.ran.append("forever")
-
-    def stop(self) -> None:
-        self.stopped = True
-
-
-@pytest.mark.parametrize(
-    ("once", "interval", "errors", "ran", "code"),
-    [
-        (True, 3600, 0, ["cycle"], 0),
-        (False, 0, 1, ["cycle"], 2),
-        (False, 3600, 0, ["forever"], 0),
-    ],
-)
-def test_run_sync_modes_and_sigterm(
+def test_run_defaults_to_full(
     monkeypatch: pytest.MonkeyPatch,
-    store: QdrantStore,
-    once: bool,
-    interval: int,
-    errors: int,
-    ran: list[str],
-    code: int,
+    make_settings: SettingsFactory,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    service = FakeService(errors)
+    _use_settings(monkeypatch, make_settings())
+    seen: list[Any] = []
+    _fake_run(monkeypatch, RunResult("ok", RunCounts(seen=3, added=2)), seen)
+    with caplog.at_level("INFO"):
+        assert cli.main([]) == 0
+    assert seen[0][0] == "full"
+    assert "Sync complete. seen=3 added=2" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("result", "code", "log"),
+    [
+        (RunResult("busy", RunCounts(), "locked"), 0, "Skipped: locked"),
+        (RunResult("valve", RunCounts(), "too few"), 1, "without deletions: too few"),
+        (RunResult("partial", RunCounts(), "listing failed"), 1, "listing failed"),
+        (RuntimeError("qdrant unreachable"), 1, "qdrant unreachable"),
+    ],
+)
+def test_run_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+    make_settings: SettingsFactory,
+    caplog: pytest.LogCaptureFixture,
+    result: RunResult | Exception,
+    code: int,
+    log: str,
+) -> None:
+    _use_settings(monkeypatch, make_settings())
+    _fake_run(monkeypatch, result)
+    assert cli.main(["run", "--mode", "incremental"]) == code
+    assert log in caplog.text
+
+
+def test_sigterm_stops_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+    make_settings: SettingsFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _use_settings(monkeypatch, make_settings())
+    # Any: signal handlers take (signum, frame).
     handlers: dict[int, Callable[..., Any]] = {}
-    built: dict[str, Any] = {}
-
-    def fake_service(**kwargs: Any) -> FakeService:
-        built.update(kwargs)
-        return service
-
-    monkeypatch.setattr(cli, "IngestionService", fake_service)
     monkeypatch.setattr(signal, "signal", handlers.__setitem__)
 
-    settings = make_settings(poll_interval_seconds=interval)
-    result = cli.run_sync(settings, once=once, embedder=FakeEmbedder(), store=store)
-    assert result == code
-    assert service.ran == ran
-    assert (built["heartbeat_path"] is None) == once
+    def run(settings: Settings, mode: str, stop: threading.Event) -> RunResult:
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+        assert stop.is_set()
+        return RunResult("ok", RunCounts(seen=1))
 
-    handlers[signal.SIGTERM](signal.SIGTERM, None)
-    assert service.stopped
+    monkeypatch.setattr(pipeline, "run", run)
+    with caplog.at_level("INFO"):
+        assert cli.main([]) == 0
+    assert "Stopped early. seen=1" in caplog.text
 
 
-def test_connect_store_retries_until_qdrant_is_up(
+@pytest.mark.parametrize("command", ["migrate", "run", "status"])
+def test_every_command_migrates_first(
     monkeypatch: pytest.MonkeyPatch,
+    make_settings: SettingsFactory,
+    migrations: list[str],
+    command: str,
 ) -> None:
-    attempts: list[int] = []
-    sleeps: list[float] = []
+    # A run against a database nobody migrated must not fail on missing tables.
+    _use_settings(monkeypatch, make_settings(database_url="postgresql://x"))
+    order: list[str] = []
+    monkeypatch.setattr(cli, "migrate", lambda url: order.append(f"migrate {url}"))
 
-    class FlakyStore:
-        def __init__(self, **kwargs: Any) -> None:
-            attempts.append(1)
+    def run(*args: Any) -> RunResult:
+        order.append("run")
+        return RunResult("ok", RunCounts())
 
-        def ensure_collection(self, *, vector_size: int, distance: str) -> None:
-            if len(attempts) < 3:
-                raise ResponseHandlingException(ConnectionError("not yet"))
+    def status(settings: Settings) -> dict[str, Any]:
+        order.append("status")
+        return {}
 
-    monkeypatch.setattr(cli, "QdrantStore", FlakyStore)
-    cli.connect_store(make_settings(), 8, sleep=sleeps.append)
-    assert len(attempts) == 3
-    assert sleeps == [5, 5]
-
-    attempts.clear()
-    with pytest.raises(ResponseHandlingException):
-        cli.connect_store(make_settings(), 8, attempts=2, sleep=sleeps.append)
-
-
-def test_search_and_format(store: QdrantStore) -> None:
-    embedder = FakeEmbedder()
-    service = IngestionService(
-        settings=make_settings(ingest_authors=False),
-        client=_one_book_client(),
-        store=store,
-        embedder=embedder,
-    )
-    service.run_cycle()
-
-    hits = search(store, embedder, "The Long Way", limit=3, chunk_type="item_metadata")
-    assert embedder.kinds[-1] == "query"
-    assert len(hits) == 1
-    out = io.StringIO()
-    format_hits(hits, out, show_text=True, width=60)
-    text = out.getvalue()
-    assert "[item_metadata] The Long Way" in text
-    assert "https://abs.example.com/item/b1" in text
-
-    out = io.StringIO()
-    format_hits([], out)
-    assert out.getvalue() == "No results.\n"
-
-    out = io.StringIO()
-    payload = {"title": "Pod", "episode_title": "Ep", "section_title": "S"}
-    format_hits([Hit(0.5, payload)], out)
-    assert "Pod — Ep § S" in out.getvalue()
+    monkeypatch.setattr(pipeline, "run", run)
+    monkeypatch.setattr(pipeline, "status", status)
+    assert cli.main([command]) == 0
+    assert order[0] == "migrate postgresql://x"
+    assert order[1:] == ([] if command == "migrate" else [command])
 
 
-def test_run_query(
+@pytest.mark.parametrize("command", ["migrate", "run", "status"])
+def test_failed_migration_stops_the_command(
+    monkeypatch: pytest.MonkeyPatch, make_settings: SettingsFactory, command: str
+) -> None:
+    _use_settings(monkeypatch, make_settings())
+
+    def broken(url: str) -> None:
+        raise RuntimeError("no db")
+
+    def never(*args: Any) -> Any:
+        raise AssertionError("ran without a schema")
+
+    monkeypatch.setattr(cli, "migrate", broken)
+    monkeypatch.setattr(pipeline, "run", never)
+    monkeypatch.setattr(pipeline, "status", never)
+    assert cli.main([command]) == 1
+
+
+def test_status(
     monkeypatch: pytest.MonkeyPatch,
-    store: QdrantStore,
+    make_settings: SettingsFactory,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(cli, "build_embedder", lambda settings: FakeEmbedder())
-    monkeypatch.setattr(cli, "QdrantStore", lambda **kwargs: store)
-    args = cli.build_parser().parse_args(["query", "anything"])
-    assert cli.run_query(make_settings(), args) == 0
-    assert capsys.readouterr().out == "No results.\n"
+    _use_settings(monkeypatch, make_settings())
+    monkeypatch.setattr(pipeline, "status", lambda settings: {"source": "audiobookshelf"})
+    assert cli.main(["status"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"source": "audiobookshelf"}
 
+    def broken(settings: Settings) -> dict[str, Any]:
+        raise RuntimeError("no db")
 
-def _one_book_client() -> Any:
-    from tests.fakes import FakeAbsClient, expanded_book
-
-    client = FakeAbsClient()
-    client.add(expanded_book("b1"))
-    return client
+    monkeypatch.setattr(pipeline, "status", broken)
+    assert cli.main(["status"]) == 1

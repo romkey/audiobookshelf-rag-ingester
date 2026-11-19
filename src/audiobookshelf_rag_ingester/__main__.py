@@ -1,189 +1,62 @@
-"""Command line: `audiobookshelf-rag-ingester`, or
-`python -m audiobookshelf_rag_ingester`.
+"""Command line: `audiobookshelf-rag-ingester` or `python -m audiobookshelf_rag_ingester`.
 
-With no command it syncs Audiobookshelf into Qdrant, every
-POLL_INTERVAL_SECONDS (or once with --once). `query` searches the
-collection; `healthcheck` is for the production container's health check.
+Syncs the Audiobookshelf audiobook and podcast libraries into the
+member-tier RAG pipeline: the Postgres staging store, entity registry and
+catalog table, and the Qdrant hs_catalog and hs_member collections. Runs
+once and exits.
+
+  audiobookshelf-rag-ingester migrate                 # only create or update the schema
+  audiobookshelf-rag-ingester run --mode incremental  # hourly: changed and deleted items
+  audiobookshelf-rag-ingester run --mode full         # nightly: everything, then reconcile
+  audiobookshelf-rag-ingester run --mode reindex      # rebuild points from staging
+  audiobookshelf-rag-ingester status                  # recent runs and counts, as JSON
+
+Every command first brings the database schema up to date.
 """
 
 import argparse
+import json
 import logging
 import signal
 import sys
-import time
-from collections.abc import Callable, Sequence
-from pathlib import Path
+import threading
+from collections.abc import Sequence
 from types import FrameType
 
-import httpx
-from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
+from dotenv import load_dotenv
 
-from audiobookshelf_rag_ingester import __version__, heartbeat
-from audiobookshelf_rag_ingester.abs_client import AbsClient, AbsClientError
+from audiobookshelf_rag_ingester import __version__, pipeline
 from audiobookshelf_rag_ingester.config import ConfigError, Settings
-from audiobookshelf_rag_ingester.documents import CHUNK_TYPES
-from audiobookshelf_rag_ingester.embeddings import Embedder, build_embedder
-from audiobookshelf_rag_ingester.qdrant_store import QdrantStore
-from audiobookshelf_rag_ingester.query import format_hits, search
-from audiobookshelf_rag_ingester.service import IngestionService
+from audiobookshelf_rag_ingester.db import migrate
 
 logger = logging.getLogger("audiobookshelf_rag_ingester")
 
-# Errors that mean "a service is down or misconfigured", reported without a traceback.
-SERVICE_ERRORS = (
-    AbsClientError,
-    httpx.HTTPError,
-    ResponseHandlingException,
-    UnexpectedResponse,
-    ConnectionError,
-)
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="audiobookshelf-rag-ingester", description=__doc__
-    )
-    parser.add_argument(
-        "--version", action="version", version=f"%(prog)s {__version__}"
-    )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="sync once and exit (like POLL_INTERVAL_SECONDS=0)",
-    )
-    commands = parser.add_subparsers(dest="command")
-
-    query = commands.add_parser("query", help="search the collection")
-    query.add_argument("text", help="natural-language query")
-    query.add_argument("--limit", type=int, default=5)
-    query.add_argument("--type", choices=CHUNK_TYPES, help="only this chunk_type")
-    query.add_argument("--library", help="only this library id")
-    query.add_argument("--min-score", type=float, default=None)
-    query.add_argument(
-        "--show-text", action="store_true", help="print each chunk's text"
-    )
-    query.add_argument("--width", type=int, default=100)
-
-    commands.add_parser("healthcheck", help="exit 0 if the running sync is alive")
-    return parser
-
-
-def connect_store(
-    settings: Settings,
-    vector_size: int,
-    *,
-    collection: str | None = None,
-    attempts: int = 6,
-    sleep: Callable[[float], None] = time.sleep,
-) -> QdrantStore:
-    """Open the collection, waiting for Qdrant to come up (it may start after us)."""
-    for attempt in range(1, attempts + 1):
-        try:
-            store = QdrantStore(
-                url=settings.qdrant_url,
-                api_key=settings.qdrant_api_key,
-                collection=collection or settings.qdrant_collection,
-            )
-            store.ensure_collection(
-                vector_size=vector_size, distance=settings.qdrant_distance
-            )
-        except (
-            ResponseHandlingException,
-            httpx.TransportError,
-            ConnectionError,
-        ) as exc:
-            if attempt == attempts:
-                raise
-            logger.warning(
-                "Qdrant not ready (attempt %d/%d): %s; retrying in 5s",
-                attempt,
-                attempts,
-                exc,
-            )
-            sleep(5)
-        else:
-            return store
-    raise AssertionError("unreachable")
-
-
-def run_sync(
-    settings: Settings,
-    *,
-    once: bool,
-    embedder: Embedder | None = None,
-    store: QdrantStore | None = None,
-    heartbeat_path: Path = heartbeat.DEFAULT_PATH,
-) -> int:
-    embedder = embedder or build_embedder(settings)
-    vector_size = embedder.dimension
-    logger.info("Embedding dimension: %d", vector_size)
-    store = store or connect_store(settings, vector_size)
-    catalog_store = (
-        connect_store(
-            settings, vector_size, collection=settings.qdrant_catalog_collection
-        )
-        if settings.qdrant_catalog_collection
-        else None
-    )
-    with AbsClient(
-        base_url=settings.abs_url,
-        token=settings.abs_api_token,
-        timeout_seconds=settings.request_timeout_seconds,
-        page_size=settings.abs_page_size,
-    ) as client:
-        service = IngestionService(
-            settings=settings,
-            client=client,
-            store=store,
-            catalog_store=catalog_store,
-            embedder=embedder,
-            heartbeat_path=None if once else heartbeat_path,
-        )
-
-        # `docker stop` sends SIGTERM: finish the current item, then exit.
-        def stop(signum: int, frame: FrameType | None) -> None:
-            logger.info("received signal %d, stopping after the current item", signum)
-            service.stop()
-
-        signal.signal(signal.SIGTERM, stop)
-
-        if once or settings.poll_interval_seconds <= 0:
-            stats = service.run_cycle()
-            return 2 if stats.errors else 0
-        logger.info(
-            "Continuous mode: syncing every %ss", settings.poll_interval_seconds
-        )
-        service.run_forever()
-    return 0
-
-
-def run_query(settings: Settings, args: argparse.Namespace) -> int:
-    embedder = build_embedder(settings)
-    store = QdrantStore(
-        url=settings.qdrant_url,
-        api_key=settings.qdrant_api_key,
-        collection=settings.qdrant_collection,
-    )
-    hits = search(
-        store,
-        embedder,
-        args.text,
-        limit=args.limit,
-        chunk_type=args.type,
-        library_id=args.library,
-        min_score=args.min_score,
-    )
-    format_hits(hits, sys.stdout, show_text=args.show_text, width=args.width)
-    return 0
-
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
+    parser = argparse.ArgumentParser(
+        prog="audiobookshelf-rag-ingester",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="run",
+        choices=["run", "migrate", "status"],
+        help="what to do (default: run)",
+    )
+    parser.add_argument(
+        "--mode",
+        default="full",
+        choices=["incremental", "full", "reindex"],
+        help="for run: incremental (hourly), full (nightly, default) or reindex",
+    )
     args = parser.parse_args(argv)
 
-    if args.command == "healthcheck":
-        return 0 if heartbeat.is_fresh(heartbeat.DEFAULT_PATH) else 1
-
+    # A local .env is a convenience for running outside Docker; variables
+    # already set in the environment win.
+    load_dotenv()
     try:
         settings = Settings.from_env()
     except ConfigError as e:
@@ -194,28 +67,61 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stdout,
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logger.info(
-        "audiobookshelf-rag-ingester %s (embedding=%s/%s, collection=%s)",
-        __version__,
-        settings.embedding_provider,
-        settings.embedding_model,
-        settings.qdrant_collection,
-    )
 
+    # Every command needs the schema, so apply any pending migrations first;
+    # when it is already current this is one query.
     try:
-        if args.command == "query":
-            return run_query(settings, args)
-        return run_sync(settings, once=args.once)
-    except KeyboardInterrupt:
-        logger.info("Interrupted")
-        return 130
-    except (
-        *SERVICE_ERRORS,
-        ValueError,
-    ) as exc:  # ValueError: e.g. vector size mismatch
-        logger.error("Stopping: %s", exc)
+        migrate(settings.database_url)
+    except Exception:
+        logger.exception("Migration failed")
         return 1
+    if args.command == "migrate":
+        logger.info("Database schema is up to date")
+        return 0
+
+    if args.command == "status":
+        try:
+            report = pipeline.status(settings)
+        except Exception:
+            logger.exception("Cannot read status")
+            return 1
+        sys.stdout.write(json.dumps(report, indent=2, default=str) + "\n")
+        return 0
+
+    # `docker stop` sends SIGTERM: finish the item being read, index what is
+    # staged, then stop.
+    stop = threading.Event()
+
+    def on_sigterm(signum: int, frame: FrameType | None) -> None:
+        logger.info("received signal %d, stopping after the current item", signum)
+        stop.set()
+
+    signal.signal(signal.SIGTERM, on_sigterm)
+
+    logger.info("audiobookshelf-rag-ingester %s starting a %s run", __version__, args.mode)
+    try:
+        result = pipeline.run(settings, args.mode, stop)
+    except Exception:
+        # Top level of a batch job: log the traceback and fail the run.
+        logger.exception("Sync failed")
+        return 1
+    counts = result.counts
+    summary = (
+        f"seen={counts.seen} added={counts.added} updated={counts.updated} "
+        f"deleted={counts.deleted} quarantined={counts.quarantined} errors={len(counts.errors)}"
+    )
+    match result.status:
+        case "busy":
+            logger.warning("Skipped: %s", result.message)
+            return 0
+        case "valve" | "partial":
+            logger.error("Sync finished without deletions: %s (%s)", result.message, summary)
+            return 1
+    if stop.is_set():
+        logger.info("Stopped early. %s", summary)
+    else:
+        logger.info("Sync complete. %s", summary)
+    return 0
 
 
 if __name__ == "__main__":

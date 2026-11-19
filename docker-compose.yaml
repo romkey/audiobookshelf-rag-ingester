@@ -1,12 +1,12 @@
-# Development: runs the app from your working tree, with the dev
-# dependencies installed, against a local Qdrant.
+# Development: runs the ingester from your working tree, with the dev
+# dependencies installed, against a local Qdrant and PostgreSQL.
 #
 #   cp .env.example .env              # then edit it
-#   docker compose up --build         # Qdrant dashboard: http://localhost:6333/dashboard
+#   docker compose up --build         # one full sync
+#   docker compose run --rm app uv run audiobookshelf-rag-ingester run --mode incremental
+#   docker compose run --rm app uv run audiobookshelf-rag-ingester status
 #   docker compose run --rm app bash  # a shell with everything installed
-#   docker compose run --rm app audiobookshelf-rag-ingester query "space opera"
 #
-# Restart the app (docker compose restart app) to pick up code changes.
 # Tests, lint and production have their own compose files:
 #
 #   docker compose -f docker-compose.test.yaml run --rm test
@@ -19,20 +19,26 @@ services:
       context: .
       target: dev
     # uv run re-syncs /venv if pyproject.toml or uv.lock changed.
-    command: uv run --locked python -m audiobookshelf_rag_ingester
+    command: ["uv", "run", "--locked", "audiobookshelf-rag-ingester", "run", "--mode", "full"]
     env_file:
       - path: .env
         required: false
     environment:
       QDRANT_URL: http://qdrant:6333
+      DATABASE_URL: postgresql://app:app@db:5432/app  # not-a-secret: local dev only
     # Reach a local OpenAI-compatible server on the Docker host as host.docker.internal.
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    depends_on:
-      - qdrant
     volumes:
       - .:/app
       - uv-cache:/root/.cache/uv
+    depends_on:
+      qdrant:
+        condition: service_started
+      db:
+        condition: service_healthy
+    # On SIGTERM it finishes the item it is reading and indexes what is staged.
+    stop_grace_period: 5m
 
   qdrant:
     image: qdrant/qdrant:v1.20.0
@@ -41,6 +47,23 @@ services:
     volumes:
       - qdrant-data:/qdrant/storage
 
+  db:
+    image: postgres:18-trixie
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app  # not-a-secret: local dev only
+      POSTGRES_DB: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
 volumes:
   uv-cache:
   qdrant-data:
+  db-data:

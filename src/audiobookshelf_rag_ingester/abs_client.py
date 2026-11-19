@@ -56,9 +56,7 @@ class AbsClient:
     # HTTP helpers
     # ------------------------------------------------------------------
 
-    def _request(
-        self, path: str, params: dict[str, Any] | None = None
-    ) -> httpx.Response:
+    def _request(self, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
         last_exc: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
             try:
@@ -136,33 +134,3 @@ class AbsClient:
         if not isinstance(data, dict):
             raise AbsClientError(f"Unexpected response for item {item_id}")
         return data
-
-    def list_authors(self, library_id: str) -> list[dict[str, Any]]:
-        data = self._get_json(f"/libraries/{library_id}/authors")
-        if isinstance(data, dict):
-            return list(data.get("authors") or data.get("results") or [])
-        return []
-
-    def download_ebook(self, item_id: str, max_bytes: int) -> bytes | None:
-        """Download an item's primary ebook file. Returns None if it is too large."""
-        with self._client.stream("GET", f"/items/{item_id}/ebook") as response:
-            if response.status_code == 404:
-                return None
-            response.raise_for_status()
-            declared = response.headers.get("content-length")
-            if declared and declared.isdigit() and int(declared) > max_bytes:
-                logger.info(
-                    "Skipping ebook for item %s: %s bytes exceeds limit",
-                    item_id,
-                    declared,
-                )
-                return None
-            buf = bytearray()
-            for chunk in response.iter_bytes():
-                buf.extend(chunk)
-                if len(buf) > max_bytes:
-                    logger.info(
-                        "Skipping ebook for item %s: exceeds size limit", item_id
-                    )
-                    return None
-            return bytes(buf)
