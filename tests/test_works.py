@@ -83,6 +83,9 @@ def test_series_and_similarity() -> None:
         ("Book 3 - The Dragon Reborn", [], "The Dragon Reborn"),
         ("Discworld", ["Discworld"], "Discworld"),
         ("Dune", [], "Dune"),
+        ("2001: A Space Odyssey", [], "2001: A Space Odyssey"),
+        ("1984", [], "1984"),
+        ("Vol. 2 - Second Things", [], "Second Things"),
     ],
 )
 def test_clean_audiobook_title(title: str, series: list[str], expected: str) -> None:

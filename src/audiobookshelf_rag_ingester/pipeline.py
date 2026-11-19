@@ -42,6 +42,7 @@ from audiobookshelf_rag_ingester.documents import (
     language_code,
     meaningful_chapters,
     ms_to_rfc3339,
+    payload_hash,
     podcast_points,
     point_id,
     year_of,
@@ -228,11 +229,14 @@ class Pipeline:
                 if i not in staged or staged[i][0] != str(listed[i].updated_at)
             ]
         )
-        self._stage_items(candidates, staged, run_id, counts, affected, changed_podcasts)
+        changed: list[str] = []
+        self._stage_items(candidates, staged, run_id, counts, affected, changed_podcasts, changed)
         if self.stop.is_set():
             # Index what was staged: the next incremental run sees those
             # items as unchanged and would never index them.
-            self._index("incremental", run_id, affected, changed_podcasts, allow_delete=False)
+            self._index_or_forget(
+                "incremental", run_id, affected, changed_podcasts, changed, allow_delete=False
+            )
             return RunResult("ok", counts, "stopped early")
 
         media = self.db.staged_media(SOURCE)
@@ -259,8 +263,34 @@ class Pipeline:
                 f"Listing failed for libraries {', '.join(sorted(failed))}; their items were "
                 "neither updated nor deleted"
             )
-        self._index(mode, run_id, affected, changed_podcasts, allow_delete=status == "ok")
+        self._index_or_forget(
+            mode, run_id, affected, changed_podcasts, changed, allow_delete=status == "ok"
+        )
         return RunResult(status, counts, message)
+
+    def _index_or_forget(
+        self,
+        mode: Mode,
+        run_id: str,
+        affected: set[str],
+        changed_podcasts: set[str],
+        changed: list[str],
+        *,
+        allow_delete: bool,
+    ) -> None:
+        """Index; if that fails, make the next incremental run restage what changed.
+
+        Staging is committed first, and incremental runs skip items whose
+        updatedAt matches staging, so a failed index would otherwise leave
+        them unindexed until the next full run.
+        """
+        try:
+            self._index(mode, run_id, affected, changed_podcasts, allow_delete=allow_delete)
+        except Exception:
+            self.db.conn.rollback()
+            self.db.forget_versions(SOURCE, changed)
+            self.db.commit()
+            raise
 
     def _libraries(self) -> list[Library]:
         libraries = [parse_library(d) for d in self.client.list_libraries()]
@@ -304,6 +334,7 @@ class Pipeline:
         counts: RunCounts,
         affected: set[str],
         changed_podcasts: set[str],
+        changed: list[str],
     ) -> None:
         unchanged: list[str] = []
         for item_id in item_ids:
@@ -329,6 +360,7 @@ class Pipeline:
                 counts.errors.append(f"item {item_id}: {type(e).__name__}: {e}")
                 continue
             self.db.commit()
+            changed.append(item_id)
             if item_id in staged:
                 counts.updated += 1
             else:
@@ -667,15 +699,32 @@ class Pipeline:
     def _embed_points(
         self, store: QdrantStore, items: list[tuple[str, JSON]], *, force: bool
     ) -> int:
-        """Upsert (point id, payload) items, embedding only changed text."""
+        """Upsert (point id, payload) items, embedding only changed text.
+
+        A point whose text is unchanged but whose other payload fields changed
+        (year, languages, url, manifestations) gets its payload rewritten
+        without re-embedding.
+        """
         if not items:
             return 0
-        existing = {} if force else store.existing_hashes(i for i, _ in items)
-        todo = [(i, p) for i, p in items if force or existing.get(i) != p["content_hash"]]
-        unchanged = [i for i, p in items if i in existing and existing[i] == p["content_hash"]]
-        if not force and unchanged:
-            run_id = items[0][1]["sync_run_id"]
-            store.set_payload(unchanged, {"sync_run_id": run_id})
+        for _, payload in items:
+            payload["payload_hash"] = payload_hash(payload)
+        existing = {} if force else store.existing_state(i for i, _ in items)
+        todo = [
+            (i, p)
+            for i, p in items
+            if force or (existing.get(i) or (None,))[0] != p["content_hash"]
+        ]
+        same_text = [
+            (i, p)
+            for i, p in items
+            if not force and i in existing and existing[i][0] == p["content_hash"]
+        ]
+        stale = [(i, p) for i, p in same_text if existing[i][1] != p["payload_hash"]]
+        current = [i for i, p in same_text if existing[i][1] == p["payload_hash"]]
+        store.replace_payloads(stale)
+        if current:
+            store.set_payload(current, {"sync_run_id": items[0][1]["sync_run_id"]})
         size = self.settings.batch_size
         for start in range(0, len(todo), size):
             batch = todo[start : start + size]

@@ -154,6 +154,35 @@ class QdrantStore:
                 found[str(record.id)] = (record.payload or {}).get("content_hash")
         return found
 
+    def existing_state(self, point_ids: Iterable[str]) -> dict[str, tuple[str | None, str | None]]:
+        """point id -> (content_hash, payload_hash), for the points that exist."""
+        ids = list(point_ids)
+        found: dict[str, tuple[str | None, str | None]] = {}
+        for start in range(0, len(ids), 256):
+            records = self.client.retrieve(
+                collection_name=self.collection,
+                ids=ids[start : start + 256],
+                with_payload=["content_hash", "payload_hash"],
+            )
+            for record in records:
+                payload = record.payload or {}
+                found[str(record.id)] = (payload.get("content_hash"), payload.get("payload_hash"))
+        return found
+
+    # Any: payload values are JSON.
+    def replace_payloads(self, items: list[tuple[str, dict[str, Any]]]) -> None:
+        """Rewrite each point's payload without touching its vectors."""
+        for start in range(0, len(items), 256):
+            self.client.batch_update_points(
+                collection_name=self.collection,
+                update_operations=[
+                    qm.OverwritePayloadOperation(
+                        overwrite_payload=qm.SetPayload(payload=payload, points=[pid])
+                    )
+                    for pid, payload in items[start : start + 256]
+                ],
+            )
+
     # Any: payload values are JSON.
     def set_payload(self, point_ids: list[str], payload: dict[str, Any]) -> None:
         if point_ids:

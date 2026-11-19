@@ -84,6 +84,16 @@ def json_hash(value: Any) -> str:
     return text_hash(json.dumps(value, sort_keys=True, default=str))
 
 
+# Payload fields that change on every run without the point changing.
+_VOLATILE = frozenset({"indexed_at", "sync_run_id", "payload_hash"})
+
+
+# Any: payload values are JSON.
+def payload_hash(payload: dict[str, Any]) -> str:
+    """Hash of everything in a payload but the per-run fields."""
+    return json_hash({k: v for k, v in payload.items() if k not in _VOLATILE})
+
+
 def html_to_text(html: str | None) -> str:
     """An HTML description or show notes as plain text with paragraph breaks."""
     if not html:

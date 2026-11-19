@@ -236,6 +236,14 @@ class Database:
         )
         return {row["source_doc_id"]: (row["library_id"], row["media_type"]) for row in rows}
 
+    def forget_versions(self, source: str, doc_ids: list[str]) -> None:
+        """Make the next incremental run fetch these documents again (indexing failed)."""
+        self._exec(
+            "UPDATE staging_documents SET source_updated_at = NULL "
+            "WHERE source = %s AND source_doc_id = ANY(%s)",
+            (source, doc_ids),
+        )
+
     def touch_staging(self, source: str, doc_ids: list[str], run_id: str) -> None:
         self._exec(
             "UPDATE staging_documents SET sync_run_id = %s "

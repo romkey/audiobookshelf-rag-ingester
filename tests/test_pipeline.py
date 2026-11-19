@@ -521,3 +521,39 @@ def test_taxonomy_matches_the_ebook_source() -> None:
 
 def test_point_ids_are_stable() -> None:
     assert point_id(CATALOG_SOURCE, "isbn:1", 0) == point_id(CATALOG_SOURCE, "isbn:1", 0)
+
+
+def test_failed_index_is_retried_by_the_next_incremental_run(
+    harness: Harness, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.abs.add(expanded_book("b1"))
+    pipeline = harness.pipeline()
+
+    def broken(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("qdrant down")
+
+    monkeypatch.setattr(pipeline, "index_catalog", broken)
+    with pytest.raises(RuntimeError, match="qdrant down"):
+        pipeline.run("incremental")
+    assert harness.catalog() == []
+    # Staging kept the item, but forgot its version: the next run fetches it again.
+    harness.abs.calls.clear()
+    harness.run("incremental")
+    assert "item:b1" in harness.abs.calls
+    assert len(harness.catalog()) == 1
+
+
+def test_payload_only_change_is_written_without_reembedding(harness: Harness, db: Database) -> None:
+    harness.abs.add(expanded_book("b1"))
+    harness.run()
+    (before,) = harness.catalog()
+    assert before["year"] == 2014
+    harness.embedder.calls.clear()
+    book = expanded_book("b1", updated_at=5)
+    book["media"]["metadata"]["publishedYear"] = "2015"  # not in the catalog text
+    harness.abs.add(book)
+    harness.run("incremental")
+    (after,) = harness.catalog()
+    assert after["year"] == 2015
+    assert after["text"] == before["text"]
+    assert harness.embedder.texts == []

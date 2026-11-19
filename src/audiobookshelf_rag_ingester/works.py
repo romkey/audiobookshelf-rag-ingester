@@ -127,7 +127,10 @@ def similarity(title_a: str, title_b: str) -> float:
 # Separators between a series marker and the title: colon, hyphen, en and em dash, period.
 _SEP = r"[:\-\u2013\u2014.]"
 _NUMBER = r"(?:#\s*|book\s+|vol(?:ume|\.)?\s+|part\s+)?\d+(?:\.\d+)?"
-_LEADING_BOOK = re.compile(rf"^\s*{_NUMBER}\s*{_SEP}\s+", re.IGNORECASE)
+# "Book 3 - Title": a marker word is required, so "2001: A Space Odyssey" keeps its number.
+_LEADING_BOOK = re.compile(
+    rf"^\s*(?:#\s*|book\s+|vol(?:ume|\.)?\s+|part\s+)\d+(?:\.\d+)?\s*{_SEP}\s+", re.IGNORECASE
+)
 
 
 def clean_audiobook_title(title: str, series: list[str] | None = None) -> str:
