@@ -138,15 +138,21 @@ OpenAI-compatible embedding server. Configuration comes from `.env` (see
 
 ```bash
 cp .env.example .env   # then edit it
-docker compose -f docker-compose.prod.yaml run --rm app
+docker compose -f docker-compose.prod.yaml up -d
 ```
 
-That runs one full sync with the latest release from
+That starts the latest release from
 `ghcr.io/romkey/audiobookshelf-rag-ingester`, plus PostgreSQL and Qdrant.
-To use the pipeline's existing PostgreSQL and Qdrant, delete those services
-from the compose file and set `DATABASE_URL` and `QDRANT_URL`. Schedule it
-from cron (see the comments in `docker-compose.prod.yaml`): `incremental`
-hourly, `full` nightly. Set `APP_VERSION=X.Y.Z` to pin a release.
+It runs on its own: the first scan is a full one, then it sleeps
+`SCAN_INTERVAL_MINUTES` (default 60) between incremental scans and does a
+full reconcile once every `FULL_SCAN_INTERVAL_HOURS` (default 24). No cron
+needed. To use the pipeline's existing PostgreSQL and Qdrant, delete those
+services from the compose file and set `DATABASE_URL` and `QDRANT_URL`. Set
+`APP_VERSION=X.Y.Z` to pin a release. For a one-off scan:
+
+```bash
+docker compose -f docker-compose.prod.yaml run --rm app audiobookshelf-rag-ingester run --mode reindex
+```
 
 ### With pip
 

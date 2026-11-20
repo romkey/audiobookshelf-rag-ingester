@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import threading
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -38,7 +40,7 @@ def _use_settings(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> None:
 def _fake_run(
     monkeypatch: pytest.MonkeyPatch, result: RunResult | Exception, seen: list[Any] | None = None
 ) -> None:
-    def run(settings: Settings, mode: str, stop: threading.Event) -> RunResult:
+    def run(settings: Settings, mode: str, stop: threading.Event, beat: Any = None) -> RunResult:
         if seen is not None:
             seen.append((mode, stop))
         if isinstance(result, Exception):
@@ -66,7 +68,7 @@ def test_bad_config_exits_2(
     assert "ABS_URL" in capsys.readouterr().err
 
 
-def test_run_defaults_to_full(
+def test_run_mode_defaults_to_full(
     monkeypatch: pytest.MonkeyPatch,
     make_settings: SettingsFactory,
     caplog: pytest.LogCaptureFixture,
@@ -75,7 +77,7 @@ def test_run_defaults_to_full(
     seen: list[Any] = []
     _fake_run(monkeypatch, RunResult("ok", RunCounts(seen=3, added=2)), seen)
     with caplog.at_level("INFO"):
-        assert cli.main([]) == 0
+        assert cli.main(["run"]) == 0
     assert seen[0][0] == "full"
     assert "Sync complete. seen=3 added=2" in caplog.text
 
@@ -120,7 +122,7 @@ def test_sigterm_stops_the_run(
 
     monkeypatch.setattr(pipeline, "run", run)
     with caplog.at_level("INFO"):
-        assert cli.main([]) == 0
+        assert cli.main(["run"]) == 0
     assert "Stopped early. seen=1" in caplog.text
 
 
@@ -184,3 +186,48 @@ def test_status(
 
     monkeypatch.setattr(pipeline, "status", broken)
     assert cli.main(["status"]) == 1
+
+
+def test_serve_is_the_default_and_scans_until_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+    make_settings: SettingsFactory,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    _use_settings(monkeypatch, make_settings(scan_interval_minutes=5, full_scan_interval_hours=6))
+    monkeypatch.setattr(cli, "HEARTBEAT_PATH", tmp_path / "hb")
+    monkeypatch.setattr(pipeline, "last_full_run", lambda settings: None)
+    # Any: signal handlers take (signum, frame).
+    handlers: dict[int, Callable[..., Any]] = {}
+    monkeypatch.setattr(signal, "signal", handlers.__setitem__)
+    modes: list[str] = []
+
+    def run(settings: Settings, mode: str, stop: threading.Event, beat: Any) -> RunResult:
+        modes.append(mode)
+        beat()
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+        return RunResult("ok", RunCounts(seen=4))
+
+    monkeypatch.setattr(pipeline, "run", run)
+    with caplog.at_level("INFO"):
+        assert cli.main([]) == 0
+    assert modes == ["full"]
+    assert signal.SIGINT in handlers
+    assert "a scan every 5 minutes, a full one at least every 6 hours" in caplog.text
+    assert "Stopped early. seen=4" in caplog.text
+    assert cli.main(["healthcheck"]) == 0
+
+
+def test_healthcheck_needs_a_fresh_heartbeat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # No settings or database: it only reads the heartbeat file.
+    for name in ("ABS_URL", "ABS_API_TOKEN", "DATABASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    path = tmp_path / "hb"
+    monkeypatch.setattr(cli, "HEARTBEAT_PATH", path)
+    assert cli.main(["healthcheck"]) == 1
+    path.touch()
+    assert cli.main(["healthcheck"]) == 0
+    os.utime(path, (0, 0))
+    assert cli.main(["healthcheck"]) == 1

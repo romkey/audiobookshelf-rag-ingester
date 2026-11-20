@@ -19,6 +19,7 @@ import logging
 import threading
 import uuid
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
@@ -138,6 +139,7 @@ class Pipeline:
         llm: LLM | None = None,
         enricher: Enricher | None = None,
         stop: threading.Event | None = None,
+        beat: Callable[[], None] | None = None,
     ) -> None:
         self.settings = settings
         self.db = db
@@ -146,6 +148,9 @@ class Pipeline:
         self.llm = llm
         self.enricher = enricher
         self.stop = stop or threading.Event()
+        self.qdrant = qdrant
+        # Touched while work progresses, for the serve loop's health check.
+        self.beat = beat or (lambda: None)
         self.taxonomy = load_taxonomy(settings.topic_taxonomy_file)
         metadata = {
             "embedding_model": settings.embedding_model,
@@ -173,9 +178,18 @@ class Pipeline:
         )
         self._candidates: dict[str, list[JSON]] | None = None
 
+    def close(self) -> None:
+        """Close the HTTP clients this pipeline opened; serve builds one per scan."""
+        self.qdrant.close()
+        for client in (self.embedder, self.llm, self.enricher):
+            closer = getattr(client, "close", None)
+            if closer is not None:
+                closer()
+
     def _confirm_link(self, text: str, alias: str, entity_type: str, entity_id: str) -> bool:
         if self.llm is None:
             return False
+        self.beat()
         try:
             return self.llm.confirm_link(
                 text=text, alias=alias, entity_type=entity_type, entity_id=entity_id
@@ -314,6 +328,7 @@ class Pipeline:
         listed: dict[str, ListedItem] = {}
         failed: set[str] = set()
         for library in self._libraries():
+            self.beat()
             try:
                 for data in self.client.list_library_items(library.id):
                     item = parse_listed(data)
@@ -341,6 +356,7 @@ class Pipeline:
             if self.stop.is_set():
                 logger.info("Stopping early as requested")
                 break
+            self.beat()
             try:
                 item = parse_item(self.client.get_item(item_id))
                 raw = item.to_json()
@@ -727,6 +743,7 @@ class Pipeline:
             store.set_payload(current, {"sync_run_id": items[0][1]["sync_run_id"]})
         size = self.settings.batch_size
         for start in range(0, len(todo), size):
+            self.beat()
             batch = todo[start : start + size]
             texts = [
                 f"{p['context']}\n\n{p['text']}" if p["context"] else p["text"] for _, p in batch
@@ -773,6 +790,7 @@ class Pipeline:
         items: list[tuple[str, JSON]] = []
         gone: list[str] = []
         for work_id in work_ids:
+            self.beat()
             pid = point_id(CATALOG_SOURCE, work_id, 0)
             work = self.db.get_work(work_id)
             manifestations = self.db.manifestations(work_id) if work else []
@@ -929,6 +947,7 @@ class Pipeline:
     def _context(self, title: str, document: str, chunk: str, *, fallback: str) -> str:
         if self.llm is None:
             return fallback
+        self.beat()
         try:
             return self.llm.chunk_context(document_title=title, document=document, chunk=chunk)
         except LLMError as e:
@@ -937,7 +956,11 @@ class Pipeline:
 
 
 def build_pipeline(
-    settings: Settings, db: Database, client: AbsSource, stop: threading.Event | None
+    settings: Settings,
+    db: Database,
+    client: AbsSource,
+    stop: threading.Event | None,
+    beat: Callable[[], None] | None = None,
 ) -> Pipeline:
     llm = (
         LLM(
@@ -969,10 +992,16 @@ def build_pipeline(
         llm=llm,
         enricher=enricher,
         stop=stop,
+        beat=beat,
     )
 
 
-def run(settings: Settings, mode: Mode, stop: threading.Event | None = None) -> RunResult:
+def run(
+    settings: Settings,
+    mode: Mode,
+    stop: threading.Event | None = None,
+    beat: Callable[[], None] | None = None,
+) -> RunResult:
     with (
         Database.connect(settings.database_url) as db,
         AbsClient(
@@ -982,7 +1011,17 @@ def run(settings: Settings, mode: Mode, stop: threading.Event | None = None) -> 
             page_size=settings.abs_page_size,
         ) as client,
     ):
-        return build_pipeline(settings, db, client, stop).run(mode)
+        built = build_pipeline(settings, db, client, stop, beat)
+        try:
+            return built.run(mode)
+        finally:
+            built.close()
+
+
+def last_full_run(settings: Settings) -> datetime | None:
+    """When the last full run finished: the serve loop's cue for the next one."""
+    with Database.connect(settings.database_url) as db:
+        return db.last_full_run_at(SOURCE)
 
 
 def status(settings: Settings) -> JSON:

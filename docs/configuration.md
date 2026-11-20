@@ -116,6 +116,19 @@ model, server and query prefix; see "Querying the collection" in the README.
 | `BATCH_SIZE` | `64` | Points per embedding request and Qdrant upsert, ≥ 1. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. |
 
+## Scheduling
+
+The default command, `serve`, runs until stopped: it scans, sleeps, and
+scans again. A scan is incremental (changed and deleted items) unless no
+full scan has finished within `FULL_SCAN_INTERVAL_HOURS`, so the first scan
+on a fresh database is a full one. `run --mode ...` still does a single scan
+and exits.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `SCAN_INTERVAL_MINUTES` | `60` | Minutes to sleep after one scan ends before the next starts, ≥ 1. |
+| `FULL_SCAN_INTERVAL_HOURS` | `24` | Hours between full scans (full fetch and reconcile), ≥ 1. |
+
 ## Compose and tooling (not read by the app)
 
 | Variable | Meaning |

@@ -71,6 +71,7 @@ class Harness:
         self.embedder = FakeEmbedder()
         self.abs = FakeAbsClient()
         self.stop = threading.Event()
+        self.beats = 0
         self.prompts: list[str] = []
         self.llm: LLM | None = None
         if llm:
@@ -93,7 +94,11 @@ class Harness:
             client=self.abs,
             llm=self.llm,
             stop=self.stop,
+            beat=self.beat,
         )
+
+    def beat(self) -> None:
+        self.beats += 1
 
     def run(self, mode: str = "full") -> Any:
         return self.pipeline().run(mode)  # type: ignore[arg-type]  # tests pass valid modes
@@ -171,6 +176,7 @@ def test_first_run_stages_registers_and_indexes(harness: Harness, db: Database) 
     assert "Audiobook length: 15 hr 30 min" in point["text"]
     assert point["work_ids"] == [work]
     assert point["manifestations"][0]["source"] == SOURCE
+    assert harness.beats >= 2  # the item and its embedding batch
 
 
 def test_audiobook_joins_the_ebook_work(harness: Harness, db: Database) -> None:
@@ -557,3 +563,16 @@ def test_payload_only_change_is_written_without_reembedding(harness: Harness, db
     assert after["year"] == 2015
     assert after["text"] == before["text"]
     assert harness.embedder.texts == []
+
+
+def test_close_releases_http_clients(make_settings: SettingsFactory, db: Database) -> None:
+    # serve builds a pipeline per scan, so each one must close what it opened.
+    harness = Harness(settings=make_settings(), db=db, llm=True)
+    p = harness.pipeline()
+    from audiobookshelf_rag_ingester.enrichment import Enricher
+
+    p.enricher = Enricher(timeout_seconds=5)
+    p.close()
+    assert harness.llm is not None
+    assert harness.llm._client.is_closed
+    assert p.enricher._client.is_closed

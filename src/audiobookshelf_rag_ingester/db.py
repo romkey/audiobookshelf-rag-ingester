@@ -155,6 +155,14 @@ class Database:
         )
         return int(row["seen"]) if row else None
 
+    def last_full_run_at(self, source: str) -> datetime | None:
+        """When the source's last full run finished, whatever its outcome."""
+        row = self._one(
+            "SELECT max(finished_at) AS at FROM sync_runs WHERE source = %s AND mode = 'full'",
+            (source,),
+        )
+        return row["at"] if row else None
+
     def recent_runs(self, source: str, limit: int = 10) -> list[Row]:
         return self._all(
             "SELECT * FROM sync_runs WHERE source = %s ORDER BY started_at DESC LIMIT %s",

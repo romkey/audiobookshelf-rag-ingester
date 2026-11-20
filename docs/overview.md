@@ -4,10 +4,13 @@
 pipeline (plans 00 "shared architecture" and 03 "audiobook library"),
 following the pattern of the ebook source, calibre-web2rag (plan 02).
 Member tier only.
-**Runs as:** a batch CLI. Every command first applies pending schema
-migrations; `run --mode incremental` (hourly), `run --mode full` (nightly)
-or `run --mode reindex` syncs once and exits; `status` prints recent runs as
-JSON.
+**Runs as:** a long-running worker with no port. The default command,
+`serve`, scans every `SCAN_INTERVAL_MINUTES` (default 60): incremental scans,
+plus a full reconcile when none has finished in `FULL_SCAN_INTERVAL_HOURS`
+(default 24). It touches a heartbeat file that `healthcheck` checks.
+`run --mode incremental|full|reindex` does one scan and exits; `status`
+prints recent runs as JSON. Every command except `healthcheck` first applies
+pending schema migrations.
 **Talks to:** the Audiobookshelf REST API (read-only, a non-admin token),
 PostgreSQL and Qdrant (both shared with the pipeline's other sources), an
 OpenAI-compatible gateway (embeddings and generation), Open Library and
@@ -59,6 +62,7 @@ Google Books.
 The SQL in `migrations/versions/v0001_*.py` (`CREATE ... IF NOT EXISTS` of
 the shared tables), `works.py` up to the audiobook section, `sanitize.py`,
 `linker.py`, `sparse.py` (and its `SPARSE_ENCODER` id), `chunking.py`,
+`schedule.py` (the `serve` loop and heartbeat), `db.last_full_run_at`,
 `taxonomy.txt`, and in `documents.py` `point_id`, `base_payload` and
 `catalog_text`. Both sources rebuild the same `hs_catalog` point for a
 work, so their catalog text and payload must match. This repo's Alembic

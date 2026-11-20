@@ -116,6 +116,9 @@ class OpenAIEmbedder:
             timeout=self.timeout_seconds,
         )
 
+    def close(self) -> None:
+        self._client.close()
+
     def encode(self, chunks: list[str], kind: EmbedKind = "document") -> list[list[float]]:
         prefix = self.prefixes.for_kind(kind)
         if not chunks:

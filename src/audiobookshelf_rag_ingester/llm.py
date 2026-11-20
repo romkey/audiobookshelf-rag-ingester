@@ -67,6 +67,9 @@ class LLM:
             transport=transport,
         )
 
+    def close(self) -> None:
+        self._client.close()
+
     def chat(self, system: str, user: str) -> str:
         """One chat completion (``POST {base_url}/chat/completions``)."""
         try:
