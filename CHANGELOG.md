@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Runs self-contained again: the default command is now `serve`, which
+  scans, sleeps `SCAN_INTERVAL_MINUTES` (default 60) and scans again until
+  stopped. Scans are incremental, plus a full reconcile when none has
+  finished in `FULL_SCAN_INTERVAL_HOURS` (default 24); the first scan on a
+  fresh database is full. `docker compose up` no longer exits after one
+  scan, and cron is no longer needed. `run --mode ...` still does one scan.
+
+### Added
+
+- `healthcheck` command and heartbeat file, used by the production compose
+  health check.
+
 ## [0.3.0] - 2026-11-19
 
 ### Changed

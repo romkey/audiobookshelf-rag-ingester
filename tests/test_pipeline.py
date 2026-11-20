@@ -71,6 +71,7 @@ class Harness:
         self.embedder = FakeEmbedder()
         self.abs = FakeAbsClient()
         self.stop = threading.Event()
+        self.beats = 0
         self.prompts: list[str] = []
         self.llm: LLM | None = None
         if llm:
@@ -93,7 +94,11 @@ class Harness:
             client=self.abs,
             llm=self.llm,
             stop=self.stop,
+            beat=self.beat,
         )
+
+    def beat(self) -> None:
+        self.beats += 1
 
     def run(self, mode: str = "full") -> Any:
         return self.pipeline().run(mode)  # type: ignore[arg-type]  # tests pass valid modes
@@ -171,6 +176,7 @@ def test_first_run_stages_registers_and_indexes(harness: Harness, db: Database) 
     assert "Audiobook length: 15 hr 30 min" in point["text"]
     assert point["work_ids"] == [work]
     assert point["manifestations"][0]["source"] == SOURCE
+    assert harness.beats >= 2  # the item and its embedding batch
 
 
 def test_audiobook_joins_the_ebook_work(harness: Harness, db: Database) -> None:

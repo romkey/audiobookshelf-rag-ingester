@@ -2,7 +2,7 @@
 # dependencies installed, against a local Qdrant and PostgreSQL.
 #
 #   cp .env.example .env              # then edit it
-#   docker compose up --build         # one full sync
+#   docker compose up --build         # serve: scan every SCAN_INTERVAL_MINUTES
 #   docker compose run --rm app uv run audiobookshelf-rag-ingester run --mode incremental
 #   docker compose run --rm app uv run audiobookshelf-rag-ingester status
 #   docker compose run --rm app bash  # a shell with everything installed
@@ -19,7 +19,7 @@ services:
       context: .
       target: dev
     # uv run re-syncs /venv if pyproject.toml or uv.lock changed.
-    command: ["uv", "run", "--locked", "audiobookshelf-rag-ingester", "run", "--mode", "full"]
+    command: ["uv", "run", "--locked", "audiobookshelf-rag-ingester", "serve"]
     env_file:
       - path: .env
         required: false

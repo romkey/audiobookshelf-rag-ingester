@@ -79,6 +79,19 @@ def test_runs_and_previous_full_run(db: Database) -> None:
     assert [r["run_id"] for r in db.recent_runs("calibre")] == ["b", "a"]
 
 
+def test_last_full_run_at(db: Database) -> None:
+    assert db.last_full_run_at("calibre") is None
+    db.start_run(run_id="a", source="calibre", mode="full")
+    assert db.last_full_run_at("calibre") is None  # not finished
+    db.finish_run(run_id="a", counts=RunCounts(), ok=False, message="valve")
+    finished = db.last_full_run_at("calibre")
+    assert finished is not None  # a failed full run still counts
+    db.start_run(run_id="b", source="calibre", mode="incremental")
+    db.finish_run(run_id="b", counts=RunCounts(), ok=True)
+    assert db.last_full_run_at("calibre") == finished
+    assert db.last_full_run_at("other") is None
+
+
 def test_registry_merges_and_series(db: Database) -> None:
     db.upsert_series("series:s", "S")
     db.upsert_series("series:s", "S Again")

@@ -1,20 +1,19 @@
 # Production: runs the released image from ghcr.io. Configure it in .env
 # next to this file (see .env.example and docs/configuration.md).
 #
-#   docker compose -f docker-compose.prod.yaml run --rm app      # one full sync
-#   APP_VERSION=1.2.3 docker compose -f docker-compose.prod.yaml run --rm app   # pin a release
-#   docker compose -f docker-compose.prod.yaml build              # build the image locally
+#   docker compose -f docker-compose.prod.yaml up -d             # start it
+#   APP_VERSION=1.2.3 docker compose -f docker-compose.prod.yaml up -d   # pin a release
+#   docker compose -f docker-compose.prod.yaml build             # build the image locally
 #
-# The ingester is a batch job: each run syncs and exits, so it has no port,
-# no health check and doesn't restart. Schedule it from cron:
+# The ingester runs on its own (`serve`): a scan, then it sleeps
+# SCAN_INTERVAL_MINUTES (default 60) and scans again. Scans are incremental,
+# with a full reconcile every FULL_SCAN_INTERVAL_HOURS (default 24). It has
+# no port; its health check reads a heartbeat file. A one-off scan:
 #
-#   # hourly: changed and deleted items; nightly: full reconcile
-#   C="docker compose -f /srv/abs-rag/docker-compose.prod.yaml run --rm app"
-#   10 * * * * $C audiobookshelf-rag-ingester run --mode incremental
-#   40 3 * * * $C audiobookshelf-rag-ingester run --mode full
+#   docker compose -f docker-compose.prod.yaml run --rm app audiobookshelf-rag-ingester run --mode reindex
 #
-# Each run applies any pending database migrations before it syncs.
-# Overlapping runs are safe: a second run finds the lock held and exits.
+# Each scan applies any pending database migrations first. Overlapping
+# scans are safe: a second one finds the lock held and skips.
 #
 # PostgreSQL and Qdrant are shared with the pipeline's other ingesters (the
 # ebook source writes the same works, catalog table and collections). If they
@@ -27,8 +26,14 @@ services:
     build:
       context: .
       target: production
-    command: ["audiobookshelf-rag-ingester", "run", "--mode", "full"]
-    restart: "no"
+    command: ["audiobookshelf-rag-ingester", "serve"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "audiobookshelf-rag-ingester", "healthcheck"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     # On SIGTERM it finishes the item it is reading and indexes what is staged.
     stop_grace_period: 5m
     env_file:
