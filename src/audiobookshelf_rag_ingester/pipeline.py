@@ -148,6 +148,7 @@ class Pipeline:
         self.llm = llm
         self.enricher = enricher
         self.stop = stop or threading.Event()
+        self.qdrant = qdrant
         # Touched while work progresses, for the serve loop's health check.
         self.beat = beat or (lambda: None)
         self.taxonomy = load_taxonomy(settings.topic_taxonomy_file)
@@ -177,9 +178,18 @@ class Pipeline:
         )
         self._candidates: dict[str, list[JSON]] | None = None
 
+    def close(self) -> None:
+        """Close the HTTP clients this pipeline opened; serve builds one per scan."""
+        self.qdrant.close()
+        for client in (self.embedder, self.llm, self.enricher):
+            closer = getattr(client, "close", None)
+            if closer is not None:
+                closer()
+
     def _confirm_link(self, text: str, alias: str, entity_type: str, entity_id: str) -> bool:
         if self.llm is None:
             return False
+        self.beat()
         try:
             return self.llm.confirm_link(
                 text=text, alias=alias, entity_type=entity_type, entity_id=entity_id
@@ -318,6 +328,7 @@ class Pipeline:
         listed: dict[str, ListedItem] = {}
         failed: set[str] = set()
         for library in self._libraries():
+            self.beat()
             try:
                 for data in self.client.list_library_items(library.id):
                     item = parse_listed(data)
@@ -779,6 +790,7 @@ class Pipeline:
         items: list[tuple[str, JSON]] = []
         gone: list[str] = []
         for work_id in work_ids:
+            self.beat()
             pid = point_id(CATALOG_SOURCE, work_id, 0)
             work = self.db.get_work(work_id)
             manifestations = self.db.manifestations(work_id) if work else []
@@ -999,7 +1011,11 @@ def run(
             page_size=settings.abs_page_size,
         ) as client,
     ):
-        return build_pipeline(settings, db, client, stop, beat).run(mode)
+        built = build_pipeline(settings, db, client, stop, beat)
+        try:
+            return built.run(mode)
+        finally:
+            built.close()
 
 
 def last_full_run(settings: Settings) -> datetime | None:

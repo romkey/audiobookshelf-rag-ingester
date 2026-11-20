@@ -563,3 +563,16 @@ def test_payload_only_change_is_written_without_reembedding(harness: Harness, db
     assert after["year"] == 2015
     assert after["text"] == before["text"]
     assert harness.embedder.texts == []
+
+
+def test_close_releases_http_clients(make_settings: SettingsFactory, db: Database) -> None:
+    # serve builds a pipeline per scan, so each one must close what it opened.
+    harness = Harness(settings=make_settings(), db=db, llm=True)
+    p = harness.pipeline()
+    from audiobookshelf_rag_ingester.enrichment import Enricher
+
+    p.enricher = Enricher(timeout_seconds=5)
+    p.close()
+    assert harness.llm is not None
+    assert harness.llm._client.is_closed
+    assert p.enricher._client.is_closed
